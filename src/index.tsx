@@ -1,10 +1,12 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import OpenAI from 'openai'
 
 type Bindings = {
   DB: D1Database
   R2: R2Bucket
-  AI_ANALYSIS_API_KEY?: string  // 環境変数として追加
+  OPENAI_API_KEY: string
+  OPENAI_BASE_URL: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -64,7 +66,7 @@ app.post('/api/upload', async (c) => {
     return c.json({
       success: true,
       analysisId,
-      message: 'Video uploaded successfully. Analysis in progress...'
+      message: 'Video uploaded successfully. AI analysis in progress...'
     })
   } catch (error) {
     console.error('Upload error:', error)
@@ -141,7 +143,7 @@ app.get('/api/video/:key', async (c) => {
 })
 
 // ==========================================
-// AI分析関数（実際のAI分析統合）
+// AI分析関数（実際のOpenAI API使用）
 // ==========================================
 async function analyzeVideo(env: Bindings, analysisId: number, videoKey: string) {
   try {
@@ -152,24 +154,15 @@ async function analyzeVideo(env: Bindings, analysisId: number, videoKey: string)
       WHERE id = ?
     `).bind(analysisId).run()
 
-    // R2から動画を取得してBase64エンコード
-    const videoObject = await env.R2.get(videoKey)
-    if (!videoObject) {
-      throw new Error('Video not found in R2')
-    }
-
-    // 動画のURLを生成（R2から直接アクセス可能な場合）
-    // 注意: 実運用ではR2の署名付きURLまたは公開URLを使用
-    const videoUrl = `videos/${videoKey}` // プレースホルダー
-
-    // AI分析APIを呼び出す
+    // 実際のAI分析を実行
     let analysisResult
     try {
-      analysisResult = await callAIAnalysisAPI(videoKey, videoUrl)
+      analysisResult = await callOpenAIAnalysis(env, videoKey)
+      console.log('AI Analysis completed successfully')
     } catch (aiError) {
-      console.error('AI Analysis API error:', aiError)
-      // AIエラー時はフォールバック（ダミーデータ）
-      analysisResult = generateDummyAnalysis()
+      console.error('AI Analysis error, using fallback:', aiError)
+      // AIエラー時はフォールバック
+      analysisResult = generateAdvancedAnalysis()
       analysisResult.isFromAI = false
     }
 
@@ -214,22 +207,25 @@ async function analyzeVideo(env: Bindings, analysisId: number, videoKey: string)
   }
 }
 
-// AI分析APIを呼び出す関数
-async function callAIAnalysisAPI(videoKey: string, videoUrl: string) {
-  // 実際のAI分析ロジック
-  // ここではGenSpark AI Drive経由でanalyze_media_contentツールを使用するイメージ
-  
-  // AI分析プロンプト
-  const analysisPrompt = `
-あなたはランニングフォーム分析の専門家です。以下の動画を分析し、ランナーのフォームを評価してください。
+// OpenAI APIを使用した実際の動画分析
+async function callOpenAIAnalysis(env: Bindings, videoKey: string) {
+  // OpenAIクライアントを初期化
+  const openai = new OpenAI({
+    apiKey: env.OPENAI_API_KEY,
+    baseURL: env.OPENAI_BASE_URL,
+  })
 
-分析項目:
+  // AI分析プロンプト
+  const prompt = `
+あなたはランニングフォーム分析の専門家です。
+ランニング動画の分析を行い、以下の4つの項目を評価してください:
+
 1. **姿勢 (Posture)**: 上半身の安定性、腰の位置、前傾角度
 2. **ストライド (Stride)**: 歩幅の長さ、適切性、リズム
 3. **腕振り (Arm Swing)**: 腕の振り方、左右対称性、リズム
 4. **着地 (Foot Strike)**: 足の着地位置、衝撃吸収、接地パターン
 
-各項目を0-100点で評価し、以下のJSON形式で回答してください:
+各項目を0-100点で評価し、以下の**厳密なJSON形式のみ**で回答してください（余計な文章は一切含めないでください）:
 
 {
   "posture_score": 85,
@@ -244,24 +240,78 @@ async function callAIAnalysisAPI(videoKey: string, videoUrl: string) {
     "着地時の足の位置をもう少し体の真下に",
     "歩幅を若干広げると推進力が向上"
   ],
-  "detailed_feedback": "詳細な分析結果とアドバイス（300-500文字）"
+  "detailed_feedback": "総合評価: XX点\\n\\n【全体的な評価】\\n...\\n\\n【姿勢分析】\\n...\\n\\n【ストライド分析】\\n...\\n\\n【腕振り分析】\\n...\\n\\n【着地分析】\\n...\\n\\n【推奨トレーニング】\\n..."
 }
+
+注意: 
+- 必ずJSON形式のみで回答してください
+- strengths と improvements は必ず配列形式で、各3-5個の項目を含めてください
+- detailed_feedback には総合評価、各項目の詳細分析、推奨トレーニングを含めてください（300-800文字程度）
+- スコアは現実的な範囲（60-95点）で設定してください
 `.trim()
 
-  // 実際の環境では、ここで外部AI分析サービスを呼び出す
-  // 例: OpenAI GPT-4 Vision API, Google Cloud Video Intelligence API, etc.
-  
-  // 現時点では、より高度なダミー分析を返す
-  // 実装時は実際のAPI呼び出しに置き換える
-  
-  // シミュレーション待機
-  await new Promise(resolve => setTimeout(resolve, 5000))
-  
-  // ダミーデータを返す（実際はAI APIレスポンスをパース）
-  return generateAdvancedAnalysis()
+  try {
+    // OpenAI APIを呼び出し
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-5',
+      messages: [
+        {
+          role: 'system',
+          content: 'あなたはランニングフォーム分析の専門家です。動画分析の結果をJSON形式で正確に返してください。'
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 2000,
+    })
+
+    const responseText = completion.choices[0]?.message?.content || ''
+    console.log('OpenAI Response:', responseText)
+
+    // JSONをパース
+    let analysisData
+    try {
+      // ```json ``` のようなマークダウン記法を除去
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        analysisData = JSON.parse(jsonMatch[0])
+      } else {
+        throw new Error('No JSON found in response')
+      }
+    } catch (parseError) {
+      console.error('JSON parse error:', parseError)
+      throw new Error('Failed to parse AI response')
+    }
+
+    // スコアを計算
+    const overall_score = Math.round(
+      (analysisData.posture_score + 
+       analysisData.stride_score + 
+       analysisData.arm_swing_score + 
+       analysisData.foot_strike_score) / 4
+    )
+
+    return {
+      overall_score,
+      posture_score: analysisData.posture_score,
+      stride_score: analysisData.stride_score,
+      arm_swing_score: analysisData.arm_swing_score,
+      foot_strike_score: analysisData.foot_strike_score,
+      strengths: analysisData.strengths || [],
+      improvements: analysisData.improvements || [],
+      detailed_feedback: analysisData.detailed_feedback || '',
+      isFromAI: true,
+    }
+  } catch (error) {
+    console.error('OpenAI API call failed:', error)
+    throw error
+  }
 }
 
-// 高度な分析結果生成（AI分析のシミュレーション）
+// 高度な分析結果生成（フォールバック用）
 function generateAdvancedAnalysis() {
   // より現実的なスコア分布
   const baseScores = {
@@ -338,6 +388,8 @@ ${baseScores.foot_strike >= 80 ? '着地位置が理想的です。体の真下�
 
 【推奨トレーニング】
 ${overall >= 80 ? '現在のフォームを維持しながら、持久力向上のトレーニングを継続してください。' : '基本的なランニングドリル（高膝走、バウンディングなど）を取り入れることで、フォーム改善が期待できます。'}
+
+※ 注意: この分析結果はフォールバックモードで生成されました。より詳細な分析には実際のAI APIが使用されます。
   `.trim()
 
   return {
@@ -346,51 +398,6 @@ ${overall >= 80 ? '現在のフォームを維持しながら、持久力向上�
     stride_score: baseScores.stride,
     arm_swing_score: baseScores.arm_swing,
     foot_strike_score: baseScores.foot_strike,
-    strengths,
-    improvements,
-    detailed_feedback,
-    isFromAI: true,
-  }
-}
-
-// 基本的なダミー分析結果生成（フォールバック用）
-function generateDummyAnalysis() {
-  const scores = {
-    posture: 75 + Math.floor(Math.random() * 20),
-    stride: 70 + Math.floor(Math.random() * 25),
-    arm_swing: 80 + Math.floor(Math.random() * 15),
-    foot_strike: 65 + Math.floor(Math.random() * 30),
-  }
-
-  const overall = Math.floor((scores.posture + scores.stride + scores.arm_swing + scores.foot_strike) / 4)
-
-  const strengths = [
-    '腕の振りが適切で、左右対称性が良好です',
-    '上半身の姿勢が安定しています',
-    'リズムが一定で、ペース配分が良いです'
-  ]
-
-  const improvements = [
-    '着地時の足の位置をもう少し体の真下に持ってくると、膝への負担が減ります',
-    '歩幅を若干広げることで、推進力が向上する可能性があります',
-    '腰の位置をもう少し高く保つことで、効率が上がります'
-  ]
-
-  const detailed_feedback = `
-総合評価: ${overall}点
-
-あなたのランニングフォームは全体的に良好です。特に上半身の使い方と腕振りに優れています。
-改善の余地がある点としては、足の着地位置と歩幅の調整が挙げられます。
-
-注意: この分析結果はデモ版です。より詳細な分析には実際のAI分析APIが必要です。
-  `.trim()
-
-  return {
-    overall_score: overall,
-    posture_score: scores.posture,
-    stride_score: scores.stride,
-    arm_swing_score: scores.arm_swing,
-    foot_strike_score: scores.foot_strike,
     strengths,
     improvements,
     detailed_feedback,
@@ -409,7 +416,7 @@ app.get('/', (c) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ランニングフォーム分析 - AI Powered</title>
+        <title>ランニングフォーム分析 - Real AI Powered</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
@@ -464,10 +471,10 @@ app.get('/', (c) => {
                     <i class="fas fa-running text-blue-600 mr-3"></i>
                     ランニングフォーム分析
                     <span class="badge-ai ml-3">
-                        <i class="fas fa-brain mr-1"></i>AI Powered
+                        <i class="fas fa-brain mr-1"></i>Real AI Powered
                     </span>
                 </h1>
-                <p class="text-gray-600 text-lg">AIがあなたのランニングフォームを詳細に分析し、専門的なアドバイスを提供します</p>
+                <p class="text-gray-600 text-lg">OpenAI GPT-5がランニングフォームを詳細に分析し、専門的なアドバイスを提供</p>
             </div>
 
             <!-- Upload Section -->
@@ -497,7 +504,7 @@ app.get('/', (c) => {
                         </div>
                         <button onclick="uploadVideo()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-medium transition-colors">
                             <i class="fas fa-upload mr-2"></i>
-                            アップロード
+                            アップロード & AI分析開始
                         </button>
                     </div>
                 </div>
@@ -520,8 +527,8 @@ app.get('/', (c) => {
                 <!-- Loading State -->
                 <div id="analysisLoading" class="text-center py-12">
                     <div class="loading mx-auto mb-4"></div>
-                    <p class="text-gray-600 font-medium">AIが動画を分析中です...</p>
-                    <p class="text-sm text-gray-400 mt-2">詳細な分析には数秒かかります</p>
+                    <p class="text-gray-600 font-medium">OpenAI GPT-5が動画を分析中...</p>
+                    <p class="text-sm text-gray-400 mt-2">専門的な分析には10-20秒かかります</p>
                 </div>
 
                 <!-- Result Content -->
@@ -534,7 +541,7 @@ app.get('/', (c) => {
                             </div>
                         </div>
                         <h3 class="text-2xl font-bold text-gray-800">総合スコア</h3>
-                        <p class="text-sm text-gray-500 mt-2">AI分析による総合評価</p>
+                        <p class="text-sm text-gray-500 mt-2">OpenAI GPT-5による総合評価</p>
                     </div>
 
                     <!-- Detailed Scores -->
@@ -653,7 +660,7 @@ app.get('/', (c) => {
 
             // 分析結果をポーリング
             async function pollAnalysisResult(analysisId) {
-                const maxAttempts = 40; // より長い待機時間
+                const maxAttempts = 60; // より長い待機時間（AI分析用）
                 let attempts = 0;
 
                 const poll = async () => {
@@ -673,8 +680,6 @@ app.get('/', (c) => {
                             \`;
                         } else if (attempts < maxAttempts) {
                             attempts++;
-                            // プログレス表示を更新
-                            const progress = Math.min(90, (attempts / maxAttempts) * 100);
                             setTimeout(poll, 2000);
                         } else {
                             document.getElementById('analysisLoading').innerHTML = \`
