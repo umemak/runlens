@@ -249,6 +249,7 @@ app.get('/', (c) => {
     }
     @keyframes spin { to { transform: rotate(360deg); } }
     #skeletonCanvas { position: absolute; top:0; left:0; pointer-events:none; }
+    #reviewCanvas   { position: absolute; top:0; left:0; pointer-events:none; width:100%; height:100%; }
     .step-badge {
       width:28px; height:28px; border-radius:50%;
       background:#3b82f6; color:white; display:flex;
@@ -336,6 +337,87 @@ app.get('/', (c) => {
 
   <!-- 分析結果 -->
   <section id="resultSection" class="hidden">
+
+    <!-- ワイヤーフレームレビュー -->
+    <div class="bg-slate-800/60 rounded-2xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-bold">
+          <i class="fas fa-film text-cyan-400 mr-2"></i>ワイヤーフレームレビュー
+        </h3>
+        <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer select-none">
+          <input type="checkbox" id="toggleOverlay" checked
+            class="w-4 h-4 accent-cyan-400" onchange="onToggleOverlay(this.checked)">
+          骨格表示
+        </label>
+      </div>
+
+      <!-- 動画 + 骨格 canvas -->
+      <div class="relative rounded-xl overflow-hidden bg-black aspect-video mb-4">
+        <video id="reviewVideo" class="w-full h-full object-contain" muted playsinline></video>
+        <canvas id="reviewCanvas"></canvas>
+      </div>
+
+      <!-- シークバー -->
+      <div class="flex items-center gap-3 mb-3">
+        <span id="reviewCurrentTime" class="text-xs text-slate-400 w-10 text-right tabular-nums">0.0s</span>
+        <input type="range" id="reviewSeek" min="0" max="100" step="0.01" value="0"
+          class="flex-1 accent-cyan-400 cursor-pointer h-2"
+          oninput="onSeek(this.value)">
+        <span id="reviewDuration" class="text-xs text-slate-400 w-10 tabular-nums">0.0s</span>
+      </div>
+
+      <!-- 再生コントロール -->
+      <div class="flex items-center justify-center gap-3 mb-4">
+        <button onclick="stepFrame(-1)"
+          class="bg-slate-700 hover:bg-slate-600 w-10 h-10 rounded-lg text-sm transition-colors flex items-center justify-center"
+          title="コマ戻し">
+          <i class="fas fa-step-backward"></i>
+        </button>
+        <button id="playPauseBtn" onclick="togglePlayPause()"
+          class="bg-cyan-600 hover:bg-cyan-500 px-8 h-10 rounded-lg font-semibold text-sm transition-colors">
+          <i class="fas fa-play mr-1"></i>再生
+        </button>
+        <button onclick="stepFrame(1)"
+          class="bg-slate-700 hover:bg-slate-600 w-10 h-10 rounded-lg text-sm transition-colors flex items-center justify-center"
+          title="コマ送り">
+          <i class="fas fa-step-forward"></i>
+        </button>
+        <select id="reviewSpeed" onchange="onSpeedChange(this.value)"
+          class="bg-slate-700 border border-slate-600 rounded-lg px-3 h-10 text-sm text-white ml-2">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+        </select>
+      </div>
+
+      <!-- リアルタイム角度パネル -->
+      <div id="liveAngles" class="grid grid-cols-3 gap-2 pt-3 border-t border-slate-700 text-xs">
+        <div class="bg-slate-700/50 rounded-lg p-2">
+          <p class="text-slate-400 mb-0.5">左膝</p>
+          <p id="laLeftKnee" class="font-bold text-cyan-300 tabular-nums">—</p>
+        </div>
+        <div class="bg-slate-700/50 rounded-lg p-2">
+          <p class="text-slate-400 mb-0.5">右膝</p>
+          <p id="laRightKnee" class="font-bold text-cyan-300 tabular-nums">—</p>
+        </div>
+        <div class="bg-slate-700/50 rounded-lg p-2">
+          <p class="text-slate-400 mb-0.5">体幹前傾</p>
+          <p id="laTrunk" class="font-bold text-orange-300 tabular-nums">—</p>
+        </div>
+        <div class="bg-slate-700/50 rounded-lg p-2">
+          <p class="text-slate-400 mb-0.5">左肘</p>
+          <p id="laLeftElbow" class="font-bold text-purple-300 tabular-nums">—</p>
+        </div>
+        <div class="bg-slate-700/50 rounded-lg p-2">
+          <p class="text-slate-400 mb-0.5">右肘</p>
+          <p id="laRightElbow" class="font-bold text-purple-300 tabular-nums">—</p>
+        </div>
+        <div class="bg-slate-700/50 rounded-lg p-2">
+          <p class="text-slate-400 mb-0.5">左右対称</p>
+          <p id="laSymmetry" class="font-bold text-green-300 tabular-nums">—</p>
+        </div>
+      </div>
+    </div>
 
     <!-- 総合スコア -->
     <div class="bg-slate-800/60 rounded-2xl p-8 mb-6 text-center">
@@ -425,6 +507,13 @@ let selectedFile   = null
 let analysisId     = null
 let poseFrames     = []      // 全フレームの角度データ
 let drawUtils      = null
+
+// レビュー用
+let reviewDrawUtils   = null
+let reviewCtx         = null
+let reviewOverlayOn   = true
+let reviewRafId       = null   // requestAnimationFrame ID
+let reviewVideoUrl    = null
 
 // ==========================================
 // ファイル選択
@@ -817,6 +906,166 @@ function showResult(data, summary) {
 
   // 詳細フィードバック
   document.getElementById('detailedFeedback').textContent = data.detailed_feedback
+
+  // ── ワイヤーフレームレビューをセットアップ ──
+  setupReview()
+}
+
+// ==========================================
+// ワイヤーフレームレビュー
+// ==========================================
+function setupReview() {
+  const rv  = document.getElementById('reviewVideo')
+  const rc  = document.getElementById('reviewCanvas')
+  reviewCtx = rc.getContext('2d')
+  reviewDrawUtils = new DrawingUtils(reviewCtx)
+
+  // 動画ソースをセット（解析時と同じファイル）
+  if (reviewVideoUrl) URL.revokeObjectURL(reviewVideoUrl)
+  reviewVideoUrl = URL.createObjectURL(selectedFile)
+  rv.src = reviewVideoUrl
+
+  rv.addEventListener('loadedmetadata', () => {
+    // canvas サイズを動画に合わせる
+    rc.width  = rv.videoWidth
+    rc.height = rv.videoHeight
+
+    // シークバー最大値を動画時間に設定
+    const seekEl = document.getElementById('reviewSeek')
+    seekEl.max   = rv.duration
+    document.getElementById('reviewDuration').textContent = rv.duration.toFixed(1) + 's'
+
+    // 最初のフレームを描画
+    renderReviewFrame()
+  }, { once: true })
+
+  // 再生中のループ描画
+  rv.addEventListener('timeupdate', () => {
+    document.getElementById('reviewSeek').value        = rv.currentTime
+    document.getElementById('reviewCurrentTime').textContent = rv.currentTime.toFixed(1) + 's'
+    renderReviewFrame()
+  })
+
+  rv.addEventListener('ended', () => {
+    document.getElementById('playPauseBtn').innerHTML =
+      '<i class="fas fa-play mr-1"></i>再生'
+  })
+}
+
+// 現在フレームの骨格を描画し角度パネルを更新
+function renderReviewFrame() {
+  const rv  = document.getElementById('reviewVideo')
+  const rc  = document.getElementById('reviewCanvas')
+
+  reviewCtx.clearRect(0, 0, rc.width, rc.height)
+
+  if (!reviewOverlayOn || !poseLandmarker) return
+
+  // poseFrames から最近傍フレームを探す
+  const t = rv.currentTime
+  if (poseFrames.length === 0) return
+
+  let nearest = poseFrames[0]
+  let minDiff = Math.abs(poseFrames[0].timestamp - t)
+  for (const f of poseFrames) {
+    const d = Math.abs(f.timestamp - t)
+    if (d < minDiff) { minDiff = d; nearest = f }
+  }
+
+  const lm = nearest.landmarks
+
+  // 接続線（緑）
+  reviewDrawUtils.drawConnectors(
+    lm, PoseLandmarker.POSE_CONNECTIONS,
+    { color: '#00FF88', lineWidth: 2 }
+  )
+  // ランドマーク点（赤ピンク）
+  reviewDrawUtils.drawLandmarks(lm, { color: '#FF3366', radius: 3 })
+
+  // 主要角度をキャンバス上にテキスト描画
+  if (reviewOverlayOn) drawAngleLabels(reviewCtx, lm, nearest.angles, rc.width, rc.height)
+
+  // 角度パネルを更新
+  const a = nearest.angles
+  const sym = Math.max(0, 1 - (Math.abs(a.leftKnee - a.rightKnee) + Math.abs(a.leftElbow - a.rightElbow)) / 90)
+  document.getElementById('laLeftKnee').textContent   = a.leftKnee.toFixed(1)   + '°'
+  document.getElementById('laRightKnee').textContent  = a.rightKnee.toFixed(1)  + '°'
+  document.getElementById('laTrunk').textContent      = a.trunkLean.toFixed(1)  + '°'
+  document.getElementById('laLeftElbow').textContent  = a.leftElbow.toFixed(1)  + '°'
+  document.getElementById('laRightElbow').textContent = a.rightElbow.toFixed(1) + '°'
+  document.getElementById('laSymmetry').textContent   = (sym * 100).toFixed(1)  + '%'
+}
+
+// キャンバス上に角度ラベルを描画
+function drawAngleLabels(ctx, lm, angles, W, H) {
+  const px = (lm, idx) => ({ x: lm[idx].x * W, y: lm[idx].y * H })
+
+  const labels = [
+    // [テキスト, ランドマーク番号, 色]
+    [angles.leftKnee.toFixed(0)  + '°', 25, '#67e8f9'],   // 左膝
+    [angles.rightKnee.toFixed(0) + '°', 26, '#67e8f9'],   // 右膝
+    [angles.leftElbow.toFixed(0) + '°', 13, '#d8b4fe'],   // 左肘
+    [angles.rightElbow.toFixed(0)+ '°', 14, '#d8b4fe'],   // 右肘
+  ]
+
+  ctx.save()
+  ctx.font = 'bold 13px monospace'
+  ctx.textBaseline = 'middle'
+
+  for (const [text, idx, color] of labels) {
+    const p = px(lm, idx)
+    // 背景
+    const w = ctx.measureText(text).width + 8
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'
+    ctx.beginPath()
+    ctx.roundRect(p.x + 6, p.y - 10, w, 20, 4)
+    ctx.fill()
+    // テキスト
+    ctx.fillStyle = color
+    ctx.fillText(text, p.x + 10, p.y)
+  }
+  ctx.restore()
+}
+
+// 再生 / 一時停止
+window.togglePlayPause = function() {
+  const rv  = document.getElementById('reviewVideo')
+  const btn = document.getElementById('playPauseBtn')
+  if (rv.paused) {
+    rv.play()
+    btn.innerHTML = '<i class="fas fa-pause mr-1"></i>一時停止'
+  } else {
+    rv.pause()
+    btn.innerHTML = '<i class="fas fa-play mr-1"></i>再生'
+  }
+}
+
+// シークバー操作
+window.onSeek = function(val) {
+  const rv = document.getElementById('reviewVideo')
+  rv.currentTime = parseFloat(val)
+  document.getElementById('reviewCurrentTime').textContent = parseFloat(val).toFixed(1) + 's'
+  renderReviewFrame()
+}
+
+// コマ送り / コマ戻し（0.1秒単位）
+window.stepFrame = function(dir) {
+  const rv = document.getElementById('reviewVideo')
+  rv.currentTime = Math.max(0, Math.min(rv.duration, rv.currentTime + dir * 0.1))
+  document.getElementById('reviewSeek').value = rv.currentTime
+  document.getElementById('reviewCurrentTime').textContent = rv.currentTime.toFixed(1) + 's'
+  renderReviewFrame()
+}
+
+// 再生速度変更
+window.onSpeedChange = function(val) {
+  document.getElementById('reviewVideo').playbackRate = parseFloat(val)
+}
+
+// 骨格オーバーレイ ON/OFF
+window.onToggleOverlay = function(checked) {
+  reviewOverlayOn = checked
+  renderReviewFrame()
 }
 
 // ==========================================
@@ -832,11 +1081,18 @@ function showError(msg) {
 }
 
 window.resetApp = function() {
+  // レビュー動画を停止・解放
+  const rv = document.getElementById('reviewVideo')
+  if (rv) { rv.pause(); rv.src = '' }
+  if (reviewVideoUrl) { URL.revokeObjectURL(reviewVideoUrl); reviewVideoUrl = null }
+  if (reviewRafId)    { cancelAnimationFrame(reviewRafId); reviewRafId = null }
+
   poseFrames = []; selectedFile = null; analysisId = null
   hide('progressSection'); hide('resultSection'); hide('errorBox')
   show('uploadSection')
   document.getElementById('fileInfo').classList.add('hidden')
   document.getElementById('videoInput').value = ''
+  document.getElementById('playPauseBtn').innerHTML = '<i class="fas fa-play mr-1"></i>再生'
 }
 </script>
 
