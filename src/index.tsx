@@ -224,7 +224,7 @@ app.get('/', (c) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RunLens - AIランニングフォーム分析</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
   <style>
@@ -266,16 +266,16 @@ app.get('/', (c) => {
     <h1 class="text-4xl font-black tracking-tight mb-2">
       <i class="fas fa-running text-blue-400 mr-2"></i>RunLens
     </h1>
-    <p class="text-slate-400">MediaPipe WASM × GPT-5 によるランニングフォーム分析</p>
+    <p class="text-slate-400">MediaPipe WASM によるブラウザ内ランニングフォーム分析</p>
   </header>
 
   <!-- ステップ説明 -->
   <div class="bg-slate-800/60 rounded-2xl p-5 mb-8 flex gap-4 text-sm text-slate-300">
     <div class="flex items-start gap-2"><span class="step-badge">1</span><span>動画を選択</span></div>
     <div class="text-slate-600 self-center">→</div>
-    <div class="flex items-start gap-2"><span class="step-badge">2</span><span>ブラウザ内でWASM骨格解析</span></div>
+    <div class="flex items-start gap-2"><span class="step-badge">2</span><span>WASM骨格検出</span></div>
     <div class="text-slate-600 self-center">→</div>
-    <div class="flex items-start gap-2"><span class="step-badge">3</span><span>GPT-5が座標データを分析</span></div>
+    <div class="flex items-start gap-2"><span class="step-badge">3</span><span>角度・対称性を計算</span></div>
     <div class="text-slate-600 self-center">→</div>
     <div class="flex items-start gap-2"><span class="step-badge">4</span><span>結果表示</span></div>
   </div>
@@ -302,7 +302,7 @@ app.get('/', (c) => {
       </div>
       <button id="analyzeBtn" onclick="startAnalysis()"
         class="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg font-semibold text-sm transition-colors">
-        <i class="fas fa-brain mr-2"></i>WASM解析 → AI分析
+        <i class="fas fa-brain mr-2"></i>WASM骨格解析スタート
       </button>
     </div>
   </section>
@@ -645,39 +645,122 @@ window.startAnalysis = async function() {
     footStrikePattern: detectFootStrike(poseFrames),
   }
 
-  onProgress(100, 'GPT-5に送信中...')
-  wasmStatus.textContent = 'GPT-5が分析中...'
+  onProgress(100, '解析完了！結果を計算中...')
+  wasmStatus.textContent = '骨格データから評価を生成中...'
 
-  // バックエンドへ送信
-  try {
-    const res = await fetch('/api/analyze-pose', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ summary, sampleFrames: sampleFrames(poseFrames, 10) }),
-    })
-    const json = await res.json()
-    if (!json.success) throw new Error(json.error)
-    analysisId = json.analysisId
-    pollResult(analysisId, summary)
-  } catch (e) {
-    showError('分析リクエストに失敗しました: ' + e.message)
-  }
+  // ブラウザ内でスコアを算出して表示（バックエンド不要）
+  await new Promise(res => setTimeout(res, 500))
+  const localResult = calcLocalScores(summary)
+  showResult(localResult, summary)
 }
 
 // ==========================================
-// ポーリング
+// ブラウザ内スコア算出（MediaPipe結果のみで計算）
 // ==========================================
-async function pollResult(id, summary, attempt = 0) {
-  if (attempt > 60) { showError('分析がタイムアウトしました'); return }
-  const res  = await fetch('/api/analysis/' + id)
-  const data = await res.json()
+function calcLocalScores(summary) {
+  // --- 姿勢スコア（体幹前傾角と安定度）---
+  const trunkLean = summary.avgAngles.trunkLean
+  const trunkIdeal = trunkLean >= 5 && trunkLean <= 10
+  const trunkOk    = trunkLean >= 3 && trunkLean <= 15
+  const postureScore = trunkIdeal ? 90 + Math.round(summary.trunkStability * 5)
+                     : trunkOk    ? 70 + Math.round(summary.trunkStability * 5)
+                                  : 50 + Math.round(summary.trunkStability * 5)
+  const postureScoreClamped = Math.min(100, Math.max(30, postureScore))
 
-  if (data.status === 'completed') {
-    showResult(data, summary)
-  } else if (data.status === 'error') {
-    showError(data.error_message || '分析中にエラーが発生しました')
-  } else {
-    setTimeout(() => pollResult(id, summary, attempt + 1), 2000)
+  // --- ストライドスコア（膝角度の範囲と対称性）---
+  const kneeRange   = summary.maxAngles.leftKnee - summary.minAngles.leftKnee
+  const kneeRangeOk = kneeRange >= 20 && kneeRange <= 60
+  const symPct      = summary.symmetryScore * 100
+  const strideScore = Math.round(
+    (kneeRangeOk ? 80 : 60) * 0.5 + symPct * 0.5
+  )
+  const strideScoreClamped = Math.min(100, Math.max(30, strideScore))
+
+  // --- 腕振りスコア（肘角度）---
+  const avgElbow = (summary.avgAngles.leftElbow + summary.avgAngles.rightElbow) / 2
+  const elbowIdeal = avgElbow >= 80 && avgElbow <= 100
+  const elbowOk    = avgElbow >= 70 && avgElbow <= 115
+  const elbowSym   = Math.abs(summary.avgAngles.leftElbow - summary.avgAngles.rightElbow)
+  const armScore   = (elbowIdeal ? 88 : elbowOk ? 72 : 55) - Math.round(elbowSym * 0.3)
+  const armScoreClamped = Math.min(100, Math.max(30, armScore))
+
+  // --- 着地スコア（着地パターン）---
+  const footScoreMap = { forefoot: 90, midfoot: 82, heel: 62, unknown: 60 }
+  const footScore = footScoreMap[summary.footStrikePattern] ?? 60
+
+  const overall = Math.round(
+    (postureScoreClamped + strideScoreClamped + armScoreClamped + footScore) / 4
+  )
+
+  // --- 良い点 ---
+  const strengths = []
+  if (trunkIdeal) strengths.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° は理想範囲（5〜10°）です\`)
+  if (symPct >= 90) strengths.push(\`左右対称性 \${symPct.toFixed(1)}% — バランスの良いフォームです\`)
+  if (elbowIdeal) strengths.push(\`肘角度 \${avgElbow.toFixed(1)}° — 腕振りが適切です\`)
+  if (summary.footStrikePattern === 'midfoot') strengths.push('ミッドフット着地でひざへの衝撃が少ないフォームです')
+  if (summary.footStrikePattern === 'forefoot') strengths.push('フォアフット着地でランニングエコノミーに優れています')
+  if (summary.trunkStability > 0.7) strengths.push(\`体幹安定スコア \${summary.trunkStability.toFixed(2)} — 上半身がぶれずに安定しています\`)
+  if (strengths.length === 0) strengths.push('骨格データを取得できました。継続して計測すると傾向が把握できます')
+
+  // --- 改善点 ---
+  const improvements = []
+  if (!trunkOk) {
+    improvements.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° — 理想は 5〜10°。\${trunkLean < 5 ? '少し前傾を増やすと推進力が上がります' : '前傾しすぎると腰への負担が増えます'}\`)
+  }
+  if (symPct < 85) {
+    improvements.push(\`左右対称性 \${symPct.toFixed(1)}% — 90%以上が理想。左右のフォームのばらつきを減らしましょう\`)
+  }
+  if (!elbowOk) {
+    improvements.push(\`肘角度 \${avgElbow.toFixed(1)}° — 理想は 85〜95°。肘を直角に近づけると腕振りが効率的になります\`)
+  }
+  if (summary.footStrikePattern === 'heel') {
+    improvements.push('ヒールストライク着地は膝・腰への衝撃大。着地位置を体の真下に近づけることで改善できます')
+  }
+  if (kneeRange < 15) {
+    improvements.push('膝の屈伸範囲が小さいです。ストライドを意識して膝をしっかり曲げると推進力が上がります')
+  }
+  if (improvements.length === 0) improvements.push('全体的にバランスの取れたフォームです。引き続き継続してください')
+
+  // --- 詳細フィードバック ---
+  const detailed = [
+    \`総合評価: \${overall}点\`,
+    '',
+    '【姿勢・体幹】',
+    \`体幹前傾角: \${trunkLean.toFixed(1)}°（理想 5〜10°）\`,
+    \`体幹安定スコア: \${summary.trunkStability.toFixed(2)}\`,
+    trunkIdeal ? '→ 理想的な前傾角度で推進力を最大化できています。' : \`→ 前傾角度を調整することでさらに効率が向上します。\`,
+    '',
+    '【ストライド・膝】',
+    \`左膝平均: \${summary.avgAngles.leftKnee.toFixed(1)}°  右膝平均: \${summary.avgAngles.rightKnee.toFixed(1)}°\`,
+    \`膝角度範囲: \${summary.minAngles.leftKnee.toFixed(1)}°〜\${summary.maxAngles.leftKnee.toFixed(1)}°\`,
+    \`左右対称性: \${symPct.toFixed(1)}%\`,
+    '',
+    '【腕振り】',
+    \`左肘: \${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: \${summary.avgAngles.rightElbow.toFixed(1)}°（理想: 85〜95°）\`,
+    elbowIdeal ? '→ 腕振りは理想的な角度です。' : '→ 肘をさらに直角に近づけましょう。',
+    '',
+    '【着地パターン】',
+    \`着地タイプ: \${summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット'}\`,
+    summary.footStrikePattern === 'heel'
+      ? '→ ヒールストライクは衝撃吸収には優れますが、ブレーキ力が生じます。重心の真下で着地する練習をしましょう。'
+      : summary.footStrikePattern === 'midfoot'
+      ? '→ ミッドフット着地でバランスの良いフォームです。'
+      : '→ フォアフット着地でランニングエコノミーに優れています。',
+    '',
+    '【解析データ】',
+    \`解析フレーム: \${summary.frameCount}フレーム / \${summary.duration.toFixed(1)}秒\`,
+    '※ MediaPipe WASM によるブラウザ内骨格検出結果に基づく評価です',
+  ].join('\\n')
+
+  return {
+    overall_score:    overall,
+    posture_score:    postureScoreClamped,
+    stride_score:     strideScoreClamped,
+    arm_swing_score:  armScoreClamped,
+    foot_strike_score: footScore,
+    strengths,
+    improvements,
+    detailed_feedback: detailed,
   }
 }
 
