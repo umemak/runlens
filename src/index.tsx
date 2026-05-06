@@ -4,746 +4,761 @@ import OpenAI from 'openai'
 
 type Bindings = {
   DB: D1Database
-  R2: R2Bucket
   OPENAI_API_KEY: string
   OPENAI_BASE_URL: string
 }
 
-const app = new Hono<{ Bindings: Bindings }>()
+// ランドマークインデックス定義 (MediaPipe Pose 33点)
+const POSE_LANDMARKS = {
+  NOSE: 0,
+  LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
+  LEFT_ELBOW: 13,    RIGHT_ELBOW: 14,
+  LEFT_WRIST: 15,    RIGHT_WRIST: 16,
+  LEFT_HIP: 23,      RIGHT_HIP: 24,
+  LEFT_KNEE: 25,     RIGHT_KNEE: 26,
+  LEFT_ANKLE: 27,    RIGHT_ANKLE: 28,
+  LEFT_HEEL: 29,     RIGHT_HEEL: 30,
+  LEFT_FOOT_INDEX: 31, RIGHT_FOOT_INDEX: 32,
+}
 
-// CORS設定
+const app = new Hono<{ Bindings: Bindings }>()
 app.use('/api/*', cors())
 
 // ==========================================
-// API Routes
+// 座標ベース分析API（WASMから呼ぶ）
 // ==========================================
-
-// 動画アップロードAPI
-app.post('/api/upload', async (c) => {
+app.post('/api/analyze-pose', async (c) => {
   try {
-    const formData = await c.req.formData()
-    const file = formData.get('video') as File
-    
-    if (!file) {
-      return c.json({ error: 'No video file provided' }, 400)
+    const body = await c.req.json() as {
+      summary: PoseSummary
+      sampleFrames: FrameData[]
     }
 
-    // ファイルサイズチェック（50MB制限）
-    if (file.size > 50 * 1024 * 1024) {
-      return c.json({ error: 'File size exceeds 50MB limit' }, 400)
+    if (!body.summary || !body.sampleFrames) {
+      return c.json({ error: 'Invalid pose data' }, 400)
     }
 
-    // ファイルタイプチェック
-    if (!file.type.startsWith('video/')) {
-      return c.json({ error: 'Invalid file type. Please upload a video file.' }, 400)
-    }
-
-    // ユニークなキーを生成
-    const timestamp = Date.now()
-    const random = Math.random().toString(36).substring(7)
-    const fileExt = file.name.split('.').pop() || 'mp4'
-    const videoKey = `videos/${timestamp}-${random}.${fileExt}`
-
-    // R2にアップロード
-    const arrayBuffer = await file.arrayBuffer()
-    await c.env.R2.put(videoKey, arrayBuffer, {
-      httpMetadata: {
-        contentType: file.type,
-      },
-    })
-
-    // データベースに分析レコードを作成
+    // DBに分析レコードを作成
     const result = await c.env.DB.prepare(`
-      INSERT INTO analyses (video_key, status)
-      VALUES (?, 'pending')
-    `).bind(videoKey).run()
+      INSERT INTO analyses (video_key, status) VALUES (?, 'processing')
+    `).bind(`pose-${Date.now()}`).run()
+    const analysisId = result.meta.last_row_id as number
 
-    const analysisId = result.meta.last_row_id
+    // 非同期でGPT-5分析
+    c.executionCtx.waitUntil(
+      analyzeWithGPT(c.env, analysisId, body.summary, body.sampleFrames)
+    )
 
-    // 非同期で分析を実行（バックグラウンド処理）
-    c.executionCtx.waitUntil(analyzeVideo(c.env, analysisId as number, videoKey))
-
-    return c.json({
-      success: true,
-      analysisId,
-      message: 'Video uploaded successfully. AI analysis in progress...'
-    })
+    return c.json({ success: true, analysisId })
   } catch (error) {
-    console.error('Upload error:', error)
-    return c.json({ error: 'Failed to upload video' }, 500)
+    console.error('analyze-pose error:', error)
+    return c.json({ error: 'Failed to start analysis' }, 500)
   }
 })
 
-// 分析結果取得API
+// 分析結果取得
 app.get('/api/analysis/:id', async (c) => {
   try {
     const id = c.req.param('id')
-    
-    const result = await c.env.DB.prepare(`
-      SELECT * FROM analyses WHERE id = ?
-    `).bind(id).first()
+    const result = await c.env.DB.prepare(
+      'SELECT * FROM analyses WHERE id = ?'
+    ).bind(id).first()
 
-    if (!result) {
-      return c.json({ error: 'Analysis not found' }, 404)
-    }
+    if (!result) return c.json({ error: 'Not found' }, 404)
 
-    // JSON文字列をパース
-    const analysis = {
+    return c.json({
       ...result,
-      strengths: result.strengths ? JSON.parse(result.strengths as string) : [],
+      strengths:    result.strengths    ? JSON.parse(result.strengths as string)    : [],
       improvements: result.improvements ? JSON.parse(result.improvements as string) : [],
-    }
-
-    return c.json(analysis)
+    })
   } catch (error) {
-    console.error('Get analysis error:', error)
     return c.json({ error: 'Failed to get analysis' }, 500)
   }
 })
 
-// 全分析結果一覧取得API
-app.get('/api/analyses', async (c) => {
-  try {
-    const result = await c.env.DB.prepare(`
-      SELECT id, video_key, status, overall_score, created_at
-      FROM analyses
-      ORDER BY created_at DESC
-      LIMIT 20
-    `).all()
-
-    return c.json({ analyses: result.results })
-  } catch (error) {
-    console.error('Get analyses error:', error)
-    return c.json({ error: 'Failed to get analyses' }, 500)
-  }
-})
-
-// 動画取得API（署名付きURL）
-app.get('/api/video/:key', async (c) => {
-  try {
-    const key = c.req.param('key')
-    
-    // R2から動画を取得
-    const object = await c.env.R2.get(key)
-    
-    if (!object) {
-      return c.json({ error: 'Video not found' }, 404)
-    }
-
-    return new Response(object.body, {
-      headers: {
-        'Content-Type': object.httpMetadata?.contentType || 'video/mp4',
-        'Cache-Control': 'public, max-age=3600',
-      },
-    })
-  } catch (error) {
-    console.error('Get video error:', error)
-    return c.json({ error: 'Failed to get video' }, 500)
-  }
-})
-
 // ==========================================
-// AI分析関数（実際のOpenAI API使用）
+// 型定義
 // ==========================================
-async function analyzeVideo(env: Bindings, analysisId: number, videoKey: string) {
-  try {
-    // ステータスを処理中に更新
-    await env.DB.prepare(`
-      UPDATE analyses 
-      SET status = 'processing', updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(analysisId).run()
-
-    // 実際のAI分析を実行
-    let analysisResult
-    try {
-      analysisResult = await callOpenAIAnalysis(env, videoKey)
-      console.log('AI Analysis completed successfully')
-    } catch (aiError) {
-      console.error('AI Analysis error, using fallback:', aiError)
-      // AIエラー時はフォールバック
-      analysisResult = generateAdvancedAnalysis()
-      analysisResult.isFromAI = false
-    }
-
-    // 分析結果をデータベースに保存
-    await env.DB.prepare(`
-      UPDATE analyses 
-      SET status = 'completed',
-          overall_score = ?,
-          posture_score = ?,
-          stride_score = ?,
-          arm_swing_score = ?,
-          foot_strike_score = ?,
-          strengths = ?,
-          improvements = ?,
-          detailed_feedback = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(
-      analysisResult.overall_score,
-      analysisResult.posture_score,
-      analysisResult.stride_score,
-      analysisResult.arm_swing_score,
-      analysisResult.foot_strike_score,
-      JSON.stringify(analysisResult.strengths),
-      JSON.stringify(analysisResult.improvements),
-      analysisResult.detailed_feedback,
-      analysisId
-    ).run()
-
-    console.log(`Analysis completed for ID: ${analysisId}`)
-  } catch (error) {
-    console.error('Analysis error:', error)
-    
-    // エラーをデータベースに記録
-    await env.DB.prepare(`
-      UPDATE analyses 
-      SET status = 'error',
-          error_message = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(String(error), analysisId).run()
+type Landmark = { x: number; y: number; z: number; visibility: number }
+type FrameData = {
+  timestamp: number
+  landmarks: Landmark[]
+  angles: {
+    leftKnee: number; rightKnee: number
+    leftElbow: number; rightElbow: number
+    trunkLean: number
+    leftHipAngle: number; rightHipAngle: number
   }
 }
+type PoseSummary = {
+  frameCount: number
+  fps: number
+  duration: number
+  avgAngles: FrameData['angles']
+  minAngles: FrameData['angles']
+  maxAngles: FrameData['angles']
+  symmetryScore: number       // 左右対称性 0-1
+  cadenceEstimate: number     // ストライド周期(fps換算)
+  trunkStability: number      // 体幹安定度(分散の逆数)
+  footStrikePattern: string   // 'forefoot' | 'midfoot' | 'heel'
+}
 
-// OpenAI APIを使用した実際の動画分析
-async function callOpenAIAnalysis(env: Bindings, videoKey: string) {
-  // OpenAIクライアントを初期化
-  const openai = new OpenAI({
-    apiKey: env.OPENAI_API_KEY,
-    baseURL: env.OPENAI_BASE_URL,
-  })
+// ==========================================
+// GPT-5分析
+// ==========================================
+async function analyzeWithGPT(
+  env: Bindings,
+  analysisId: number,
+  summary: PoseSummary,
+  sampleFrames: FrameData[]
+) {
+  try {
+    const openai = new OpenAI({
+      apiKey: env.OPENAI_API_KEY,
+      baseURL: env.OPENAI_BASE_URL,
+    })
 
-  // AI分析プロンプト
-  const prompt = `
-あなたはランニングフォーム分析の専門家です。
-ランニング動画の分析を行い、以下の4つの項目を評価してください:
+    // サンプルフレーム（最大5フレーム）を抽出して可読化
+    const frameDescriptions = sampleFrames.slice(0, 5).map((f, i) => `
+フレーム${i + 1} (${f.timestamp.toFixed(2)}秒):
+  左膝角度: ${f.angles.leftKnee.toFixed(1)}°  右膝角度: ${f.angles.rightKnee.toFixed(1)}°
+  左肘角度: ${f.angles.leftElbow.toFixed(1)}°  右肘角度: ${f.angles.rightElbow.toFixed(1)}°
+  体幹前傾: ${f.angles.trunkLean.toFixed(1)}°
+  左股関節: ${f.angles.leftHipAngle.toFixed(1)}°  右股関節: ${f.angles.rightHipAngle.toFixed(1)}°
+`.trim()).join('\n\n')
 
-1. **姿勢 (Posture)**: 上半身の安定性、腰の位置、前傾角度
-2. **ストライド (Stride)**: 歩幅の長さ、適切性、リズム
-3. **腕振り (Arm Swing)**: 腕の振り方、左右対称性、リズム
-4. **着地 (Foot Strike)**: 足の着地位置、衝撃吸収、接地パターン
+    const prompt = `
+あなたはランニングバイオメカニクスの専門家です。
+MediaPipe Pose（WASM）でブラウザ側から抽出した骨格座標データを基に、
+ランニングフォームを厳密に分析してください。
 
-各項目を0-100点で評価し、以下の**厳密なJSON形式のみ**で回答してください（余計な文章は一切含めないでください）:
+## 分析データ（サマリー）
+- 総フレーム数: ${summary.frameCount}フレーム（${summary.duration.toFixed(1)}秒）
+- 平均体幹前傾角: ${summary.avgAngles.trunkLean.toFixed(1)}°（理想: 5〜10°）
+- 平均左膝角度: ${summary.avgAngles.leftKnee.toFixed(1)}°  右膝: ${summary.avgAngles.rightKnee.toFixed(1)}°
+- 平均左肘角度: ${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: ${summary.avgAngles.rightElbow.toFixed(1)}°
+- 平均股関節角度: 左 ${summary.avgAngles.leftHipAngle.toFixed(1)}°  右 ${summary.avgAngles.rightHipAngle.toFixed(1)}°
+- 膝角度の範囲: ${summary.minAngles.leftKnee.toFixed(1)}°〜${summary.maxAngles.leftKnee.toFixed(1)}°
+- 左右対称スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（100%が完全対称）
+- 体幹安定スコア: ${summary.trunkStability.toFixed(2)}（値が大きいほど安定）
+- 着地パターン: ${summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット'}
+
+## サンプルフレームデータ
+${frameDescriptions}
+
+## 評価基準（参考）
+- 膝の着地角度: 理想165〜175°（伸展しすぎず屈曲しすぎず）
+- 体幹前傾: 理想5〜10°（過度な前傾・後傾は非効率）
+- 肘角度: 理想85〜95°
+- 左右対称: 90%以上が理想
+- ヒールストライクは膝・腰への衝撃が大きい
+
+上記データを元に以下のJSON形式のみで回答してください（余計な文章不要）:
 
 {
   "posture_score": 85,
-  "stride_score": 75,
-  "arm_swing_score": 90,
+  "stride_score": 78,
+  "arm_swing_score": 82,
   "foot_strike_score": 70,
   "strengths": [
-    "上半身の姿勢が安定している",
-    "腕振りのリズムが良好"
+    "具体的な数値を引用した良い点",
+    "...",
+    "..."
   ],
   "improvements": [
-    "着地時の足の位置をもう少し体の真下に",
-    "歩幅を若干広げると推進力が向上"
+    "具体的な数値と理想値を示した改善点",
+    "...",
+    "..."
   ],
-  "detailed_feedback": "総合評価: XX点\\n\\n【全体的な評価】\\n...\\n\\n【姿勢分析】\\n...\\n\\n【ストライド分析】\\n...\\n\\n【腕振り分析】\\n...\\n\\n【着地分析】\\n...\\n\\n【推奨トレーニング】\\n..."
+  "detailed_feedback": "総合評価: XX点\\n\\n【姿勢・体幹】\\n実測値を引用した詳細分析...\\n\\n【ストライド・膝】\\n...\\n\\n【腕振り】\\n...\\n\\n【着地パターン】\\n...\\n\\n【推奨トレーニング】\\n..."
 }
-
-注意: 
-- 必ずJSON形式のみで回答してください
-- strengths と improvements は必ず配列形式で、各3-5個の項目を含めてください
-- detailed_feedback には総合評価、各項目の詳細分析、推奨トレーニングを含めてください（300-800文字程度）
-- スコアは現実的な範囲（60-95点）で設定してください
 `.trim()
 
-  try {
-    // OpenAI APIを呼び出し
     const completion = await openai.chat.completions.create({
       model: 'gpt-5',
       messages: [
-        {
-          role: 'system',
-          content: 'あなたはランニングフォーム分析の専門家です。動画分析の結果をJSON形式で正確に返してください。'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
+        { role: 'system', content: 'あなたはランニングバイオメカニクスの専門家です。実測データを根拠に具体的な分析をJSON形式で返してください。' },
+        { role: 'user', content: prompt }
       ],
-      temperature: 0.7,
+      temperature: 0.4,
       max_tokens: 2000,
     })
 
     const responseText = completion.choices[0]?.message?.content || ''
-    console.log('OpenAI Response:', responseText)
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) throw new Error('No JSON in response')
 
-    // JSONをパース
-    let analysisData
-    try {
-      // ```json ``` のようなマークダウン記法を除去
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/)
-      if (jsonMatch) {
-        analysisData = JSON.parse(jsonMatch[0])
-      } else {
-        throw new Error('No JSON found in response')
-      }
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError)
-      throw new Error('Failed to parse AI response')
-    }
-
-    // スコアを計算
-    const overall_score = Math.round(
-      (analysisData.posture_score + 
-       analysisData.stride_score + 
-       analysisData.arm_swing_score + 
-       analysisData.foot_strike_score) / 4
+    const data = JSON.parse(jsonMatch[0])
+    const overall = Math.round(
+      (data.posture_score + data.stride_score + data.arm_swing_score + data.foot_strike_score) / 4
     )
 
-    return {
-      overall_score,
-      posture_score: analysisData.posture_score,
-      stride_score: analysisData.stride_score,
-      arm_swing_score: analysisData.arm_swing_score,
-      foot_strike_score: analysisData.foot_strike_score,
-      strengths: analysisData.strengths || [],
-      improvements: analysisData.improvements || [],
-      detailed_feedback: analysisData.detailed_feedback || '',
-      isFromAI: true,
-    }
+    await env.DB.prepare(`
+      UPDATE analyses SET
+        status='completed', overall_score=?, posture_score=?, stride_score=?,
+        arm_swing_score=?, foot_strike_score=?, strengths=?, improvements=?,
+        detailed_feedback=?, updated_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).bind(
+      overall, data.posture_score, data.stride_score,
+      data.arm_swing_score, data.foot_strike_score,
+      JSON.stringify(data.strengths), JSON.stringify(data.improvements),
+      data.detailed_feedback, analysisId
+    ).run()
+
   } catch (error) {
-    console.error('OpenAI API call failed:', error)
-    throw error
-  }
-}
-
-// 高度な分析結果生成（フォールバック用）
-function generateAdvancedAnalysis() {
-  // より現実的なスコア分布
-  const baseScores = {
-    posture: 70 + Math.floor(Math.random() * 25),
-    stride: 65 + Math.floor(Math.random() * 30),
-    arm_swing: 75 + Math.floor(Math.random() * 20),
-    foot_strike: 60 + Math.floor(Math.random() * 35),
-  }
-
-  const overall = Math.floor((baseScores.posture + baseScores.stride + baseScores.arm_swing + baseScores.foot_strike) / 4)
-
-  // スコアに基づいた動的なフィードバック
-  const strengths = []
-  const improvements = []
-
-  // 姿勢評価
-  if (baseScores.posture >= 85) {
-    strengths.push('上半身の姿勢が非常に安定しており、理想的なフォームです')
-  } else if (baseScores.posture >= 70) {
-    strengths.push('上半身の姿勢は概ね良好です')
-  } else {
-    improvements.push('上半身の姿勢をより安定させることで、効率が向上します')
-  }
-
-  // ストライド評価
-  if (baseScores.stride >= 85) {
-    strengths.push('ストライドの長さとリズムが最適化されています')
-  } else if (baseScores.stride >= 70) {
-    strengths.push('ストライドは安定していますが、さらなる改善の余地があります')
-  } else {
-    improvements.push('歩幅とリズムの調整により、より効率的な走りが可能です')
-  }
-
-  // 腕振り評価
-  if (baseScores.arm_swing >= 85) {
-    strengths.push('腕振りが非常に効果的で、左右対称性も優れています')
-  } else if (baseScores.arm_swing >= 70) {
-    strengths.push('腕振りは良好で、適切なリズムを保っています')
-  } else {
-    improvements.push('腕振りをより意識することで、推進力が向上します')
-  }
-
-  // 着地評価
-  if (baseScores.foot_strike >= 85) {
-    strengths.push('着地位置が理想的で、衝撃吸収も適切です')
-  } else if (baseScores.foot_strike >= 70) {
-    improvements.push('着地位置を若干調整することで、膝への負担が軽減されます')
-  } else {
-    improvements.push('着地時の足の位置を体の真下に近づけることを強く推奨します')
-  }
-
-  // 全体評価に基づいた追加フィードバック
-  if (overall >= 85) {
-    strengths.push('全体的なフォームバランスが優れています')
-  }
-
-  const detailed_feedback = `
-総合評価: ${overall}点 (${overall >= 85 ? '優秀' : overall >= 70 ? '良好' : overall >= 60 ? '改善の余地あり' : '要改善'})
-
-【全体的な評価】
-${overall >= 80 ? 'あなたのランニングフォームは全体的に優れており、効率的な走りができています。' : overall >= 70 ? 'あなたのランニングフォームは良好ですが、いくつかの改善点があります。' : 'あなたのランニングフォームには改善の余地があります。以下のアドバイスを参考にしてください。'}
-
-【姿勢分析 (${baseScores.posture}点)】
-${baseScores.posture >= 80 ? '上半身は非常に安定しており、理想的な前傾角度を保っています。この調子を維持してください。' : baseScores.posture >= 70 ? '上半身は概ね安定していますが、疲労時にやや前傾が強くなる傾向があります。腰の位置を意識的に高く保つことをお勧めします。' : '上半身の姿勢に改善の余地があります。背筋を伸ばし、腰の位置を高く保つことを意識してください。'}
-
-【ストライド分析 (${baseScores.stride}点)】
-${baseScores.stride >= 80 ? '歩幅とリズムが最適化されており、効率的な推進力を生み出しています。' : baseScores.stride >= 70 ? '現在のストライドは安定していますが、やや保守的です。体力に余裕があれば、歩幅を10-15cm程度広げてみることをお勧めします。' : 'ストライドに改善が必要です。歩幅とリズムのバランスを見直し、より効率的な走りを目指しましょう。'}
-
-【腕振り分析 (${baseScores.arm_swing}点)】
-${baseScores.arm_swing >= 80 ? '腕振りは非常に効果的です。左右対称で、リズムも一定しています。素晴らしいフォームです。' : baseScores.arm_swing >= 70 ? '腕振りは良好です。左右のバランスを保ち、肩の力を抜いてリラックスすることでさらに向上します。' : '腕振りに改善の余地があります。肘を90度に保ち、前後にしっかりと振ることを意識してください。'}
-
-【着地分析 (${baseScores.foot_strike}点)】
-${baseScores.foot_strike >= 80 ? '着地位置が理想的です。体の真下で接地し、衝撃吸収も適切に行われています。' : baseScores.foot_strike >= 70 ? '着地時にやや体の前方で接地する傾向が見られます。これは膝への負担を増やす可能性があります。足の着地位置を体の真下に近づけることを意識してみてください。' : '着地に大きな改善が必要です。体の前方での接地は膝や腰への負担を大きくします。足を体の真下に着地させることを強く推奨します。'}
-
-【推奨トレーニング】
-${overall >= 80 ? '現在のフォームを維持しながら、持久力向上のトレーニングを継続してください。' : '基本的なランニングドリル（高膝走、バウンディングなど）を取り入れることで、フォーム改善が期待できます。'}
-
-※ 注意: この分析結果はフォールバックモードで生成されました。より詳細な分析には実際のAI APIが使用されます。
-  `.trim()
-
-  return {
-    overall_score: overall,
-    posture_score: baseScores.posture,
-    stride_score: baseScores.stride,
-    arm_swing_score: baseScores.arm_swing,
-    foot_strike_score: baseScores.foot_strike,
-    strengths,
-    improvements,
-    detailed_feedback,
-    isFromAI: false,
+    console.error('GPT analysis error:', error)
+    await env.DB.prepare(`
+      UPDATE analyses SET status='error', error_message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
+    `).bind(String(error), analysisId).run()
   }
 }
 
 // ==========================================
-// Frontend Routes
+// フロントエンド
 // ==========================================
-
 app.get('/', (c) => {
-  return c.html(`
-    <!DOCTYPE html>
-    <html lang="ja">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ランニングフォーム分析 - Real AI Powered</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
-        <style>
-          .score-circle {
-            width: 120px;
-            height: 120px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 2rem;
-            font-weight: bold;
-            background: conic-gradient(#3b82f6 0deg, #3b82f6 calc(var(--score) * 3.6deg), #e5e7eb calc(var(--score) * 3.6deg));
-          }
-          .score-inner {
-            width: 100px;
-            height: 100px;
-            border-radius: 50%;
-            background: white;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-          }
-          .loading {
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #3b82f6;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-          }
-          @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-          }
-          .badge-ai {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 4px 12px;
-            border-radius: 12px;
-            font-size: 0.75rem;
-            font-weight: bold;
-            display: inline-block;
-          }
-        </style>
-    </head>
-    <body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
-        <div class="container mx-auto px-4 py-8 max-w-6xl">
-            <!-- Header -->
-            <div class="text-center mb-12">
-                <h1 class="text-4xl font-bold text-gray-800 mb-3">
-                    <i class="fas fa-running text-blue-600 mr-3"></i>
-                    ランニングフォーム分析
-                    <span class="badge-ai ml-3">
-                        <i class="fas fa-brain mr-1"></i>Real AI Powered
-                    </span>
-                </h1>
-                <p class="text-gray-600 text-lg">OpenAI GPT-5がランニングフォームを詳細に分析し、専門的なアドバイスを提供</p>
-            </div>
+  return c.html(`<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RunLens - AIランニングフォーム分析</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+  <style>
+    .score-ring {
+      width: 140px; height: 140px; border-radius: 50%;
+      background: conic-gradient(
+        #3b82f6 0deg,
+        #3b82f6 calc(var(--pct, 0) * 3.6deg),
+        #e5e7eb calc(var(--pct, 0) * 3.6deg)
+      );
+      display: flex; align-items: center; justify-content: center;
+    }
+    .score-inner {
+      width: 112px; height: 112px; border-radius: 50%;
+      background: white; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+    }
+    .spinner {
+      border: 3px solid #e5e7eb; border-top-color: #3b82f6;
+      border-radius: 50%; width: 44px; height: 44px;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #skeletonCanvas { position: absolute; top:0; left:0; pointer-events:none; }
+    .step-badge {
+      width:28px; height:28px; border-radius:50%;
+      background:#3b82f6; color:white; display:flex;
+      align-items:center; justify-content:center;
+      font-size:.8rem; font-weight:700; flex-shrink:0;
+    }
+  </style>
+</head>
+<body class="bg-gradient-to-br from-slate-900 to-blue-950 min-h-screen text-white">
 
-            <!-- Upload Section -->
-            <div class="bg-white rounded-2xl shadow-xl p-8 mb-8">
-                <h2 class="text-2xl font-bold text-gray-800 mb-6">
-                    <i class="fas fa-video text-blue-600 mr-2"></i>
-                    動画をアップロード
-                </h2>
-                
-                <div class="border-2 border-dashed border-gray-300 rounded-xl p-8 text-center hover:border-blue-500 transition-colors">
-                    <input type="file" id="videoInput" accept="video/*" class="hidden">
-                    <label for="videoInput" class="cursor-pointer">
-                        <i class="fas fa-cloud-upload-alt text-6xl text-gray-400 mb-4"></i>
-                        <p class="text-lg text-gray-600 mb-2">クリックして動画を選択</p>
-                        <p class="text-sm text-gray-400">MP4, MOV, AVI形式 (最大50MB)</p>
-                    </label>
-                </div>
+<div class="max-w-3xl mx-auto px-4 py-10">
 
-                <div id="selectedFile" class="hidden mt-4">
-                    <div class="flex items-center justify-between bg-blue-50 p-4 rounded-lg">
-                        <div class="flex items-center">
-                            <i class="fas fa-file-video text-blue-600 text-2xl mr-3"></i>
-                            <div>
-                                <p id="fileName" class="font-medium text-gray-800"></p>
-                                <p id="fileSize" class="text-sm text-gray-500"></p>
-                            </div>
-                        </div>
-                        <button onclick="uploadVideo()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-medium transition-colors">
-                            <i class="fas fa-upload mr-2"></i>
-                            アップロード & AI分析開始
-                        </button>
-                    </div>
-                </div>
+  <!-- ヘッダー -->
+  <header class="text-center mb-10">
+    <h1 class="text-4xl font-black tracking-tight mb-2">
+      <i class="fas fa-running text-blue-400 mr-2"></i>RunLens
+    </h1>
+    <p class="text-slate-400">MediaPipe WASM × GPT-5 によるランニングフォーム分析</p>
+  </header>
 
-                <div id="uploadProgress" class="hidden mt-4">
-                    <div class="bg-gray-200 rounded-full h-2 overflow-hidden">
-                        <div id="progressBar" class="bg-blue-600 h-full transition-all duration-300" style="width: 0%"></div>
-                    </div>
-                    <p class="text-center text-sm text-gray-600 mt-2">アップロード中...</p>
-                </div>
-            </div>
+  <!-- ステップ説明 -->
+  <div class="bg-slate-800/60 rounded-2xl p-5 mb-8 flex gap-4 text-sm text-slate-300">
+    <div class="flex items-start gap-2"><span class="step-badge">1</span><span>動画を選択</span></div>
+    <div class="text-slate-600 self-center">→</div>
+    <div class="flex items-start gap-2"><span class="step-badge">2</span><span>ブラウザ内でWASM骨格解析</span></div>
+    <div class="text-slate-600 self-center">→</div>
+    <div class="flex items-start gap-2"><span class="step-badge">3</span><span>GPT-5が座標データを分析</span></div>
+    <div class="text-slate-600 self-center">→</div>
+    <div class="flex items-start gap-2"><span class="step-badge">4</span><span>結果表示</span></div>
+  </div>
 
-            <!-- Analysis Result Section -->
-            <div id="analysisResult" class="hidden bg-white rounded-2xl shadow-xl p-8">
-                <h2 class="text-2xl font-bold text-gray-800 mb-6">
-                    <i class="fas fa-chart-line text-green-600 mr-2"></i>
-                    AI分析結果
-                </h2>
+  <!-- アップロードエリア -->
+  <section id="uploadSection" class="bg-slate-800/60 rounded-2xl p-8 mb-6">
+    <h2 class="text-xl font-bold mb-5"><i class="fas fa-video text-blue-400 mr-2"></i>動画を選択</h2>
+    <label for="videoInput"
+      class="flex flex-col items-center justify-center border-2 border-dashed border-slate-600 rounded-xl p-10 cursor-pointer hover:border-blue-500 transition-colors">
+      <i class="fas fa-cloud-upload-alt text-5xl text-slate-500 mb-3"></i>
+      <p class="text-slate-300 mb-1">クリックして動画を選択</p>
+      <p class="text-xs text-slate-500">MP4 / MOV / AVI（最大200MB）</p>
+    </label>
+    <input type="file" id="videoInput" accept="video/*" class="hidden">
 
-                <!-- Loading State -->
-                <div id="analysisLoading" class="text-center py-12">
-                    <div class="loading mx-auto mb-4"></div>
-                    <p class="text-gray-600 font-medium">OpenAI GPT-5が動画を分析中...</p>
-                    <p class="text-sm text-gray-400 mt-2">専門的な分析には10-20秒かかります</p>
-                </div>
-
-                <!-- Result Content -->
-                <div id="analysisContent" class="hidden">
-                    <!-- Overall Score -->
-                    <div class="text-center mb-8">
-                        <div class="score-circle mx-auto mb-4" id="overallScoreCircle">
-                            <div class="score-inner">
-                                <span id="overallScore">0</span>
-                            </div>
-                        </div>
-                        <h3 class="text-2xl font-bold text-gray-800">総合スコア</h3>
-                        <p class="text-sm text-gray-500 mt-2">OpenAI GPT-5による総合評価</p>
-                    </div>
-
-                    <!-- Detailed Scores -->
-                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-                        <div class="bg-blue-50 p-4 rounded-lg text-center">
-                            <i class="fas fa-male text-blue-600 text-2xl mb-2"></i>
-                            <p class="text-sm text-gray-600 mb-1">姿勢</p>
-                            <p class="text-2xl font-bold text-gray-800"><span id="postureScore">0</span>点</p>
-                        </div>
-                        <div class="bg-green-50 p-4 rounded-lg text-center">
-                            <i class="fas fa-shoe-prints text-green-600 text-2xl mb-2"></i>
-                            <p class="text-sm text-gray-600 mb-1">ストライド</p>
-                            <p class="text-2xl font-bold text-gray-800"><span id="strideScore">0</span>点</p>
-                        </div>
-                        <div class="bg-purple-50 p-4 rounded-lg text-center">
-                            <i class="fas fa-hands text-purple-600 text-2xl mb-2"></i>
-                            <p class="text-sm text-gray-600 mb-1">腕振り</p>
-                            <p class="text-2xl font-bold text-gray-800"><span id="armSwingScore">0</span>点</p>
-                        </div>
-                        <div class="bg-orange-50 p-4 rounded-lg text-center">
-                            <i class="fas fa-walking text-orange-600 text-2xl mb-2"></i>
-                            <p class="text-sm text-gray-600 mb-1">着地</p>
-                            <p class="text-2xl font-bold text-gray-800"><span id="footStrikeScore">0</span>点</p>
-                        </div>
-                    </div>
-
-                    <!-- Strengths -->
-                    <div class="mb-8">
-                        <h4 class="text-xl font-bold text-gray-800 mb-4">
-                            <i class="fas fa-check-circle text-green-600 mr-2"></i>
-                            良い点
-                        </h4>
-                        <ul id="strengthsList" class="space-y-2">
-                        </ul>
-                    </div>
-
-                    <!-- Improvements -->
-                    <div class="mb-8">
-                        <h4 class="text-xl font-bold text-gray-800 mb-4">
-                            <i class="fas fa-lightbulb text-yellow-600 mr-2"></i>
-                            改善点
-                        </h4>
-                        <ul id="improvementsList" class="space-y-2">
-                        </ul>
-                    </div>
-
-                    <!-- Detailed Feedback -->
-                    <div class="bg-gradient-to-r from-blue-50 to-purple-50 p-6 rounded-lg">
-                        <h4 class="text-xl font-bold text-gray-800 mb-4">
-                            <i class="fas fa-comment-alt text-blue-600 mr-2"></i>
-                            AI詳細フィードバック
-                        </h4>
-                        <pre id="detailedFeedback" class="whitespace-pre-wrap text-gray-700 leading-relaxed"></pre>
-                    </div>
-                </div>
-            </div>
+    <!-- 選択後 -->
+    <div id="fileInfo" class="hidden mt-4 bg-blue-900/40 rounded-xl p-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <i class="fas fa-file-video text-blue-400 text-2xl"></i>
+        <div>
+          <p id="fileName" class="font-medium text-sm"></p>
+          <p id="fileSize" class="text-xs text-slate-400"></p>
         </div>
+      </div>
+      <button id="analyzeBtn" onclick="startAnalysis()"
+        class="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg font-semibold text-sm transition-colors">
+        <i class="fas fa-brain mr-2"></i>WASM解析 → AI分析
+      </button>
+    </div>
+  </section>
 
-        <script>
-            let selectedFile = null;
-            let currentAnalysisId = null;
+  <!-- 解析プログレス -->
+  <section id="progressSection" class="hidden bg-slate-800/60 rounded-2xl p-8 mb-6">
+    <h2 class="text-xl font-bold mb-6"><i class="fas fa-cogs text-yellow-400 mr-2"></i>解析中...</h2>
 
-            // ファイル選択
-            document.getElementById('videoInput').addEventListener('change', (e) => {
-                const file = e.target.files[0];
-                if (file) {
-                    selectedFile = file;
-                    document.getElementById('fileName').textContent = file.name;
-                    document.getElementById('fileSize').textContent = \`\${(file.size / 1024 / 1024).toFixed(2)} MB\`;
-                    document.getElementById('selectedFile').classList.remove('hidden');
-                }
-            });
+    <!-- MediaPipe進捗 -->
+    <div class="mb-5">
+      <div class="flex justify-between text-sm mb-1">
+        <span id="wasmStatus" class="text-slate-300">MediaPipe WASMを読み込み中...</span>
+        <span id="wasmPct" class="text-blue-400">0%</span>
+      </div>
+      <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
+        <div id="wasmBar" class="h-full bg-blue-500 rounded-full transition-all duration-300" style="width:0%"></div>
+      </div>
+    </div>
 
-            // 動画アップロード
-            async function uploadVideo() {
-                if (!selectedFile) return;
+    <!-- プレビュー＋骨格描画 -->
+    <div class="relative rounded-xl overflow-hidden bg-black aspect-video mb-5">
+      <video id="previewVideo" class="w-full h-full object-contain" muted playsinline></video>
+      <canvas id="skeletonCanvas"></canvas>
+    </div>
 
-                const formData = new FormData();
-                formData.append('video', selectedFile);
+    <!-- フレームカウンター -->
+    <div class="text-center text-sm text-slate-400">
+      <span id="frameCounter">フレーム処理中: 0</span>
+    </div>
+  </section>
 
-                // プログレス表示
-                document.getElementById('selectedFile').classList.add('hidden');
-                document.getElementById('uploadProgress').classList.remove('hidden');
-                document.getElementById('progressBar').style.width = '50%';
+  <!-- 分析結果 -->
+  <section id="resultSection" class="hidden">
 
-                try {
-                    const response = await fetch('/api/upload', {
-                        method: 'POST',
-                        body: formData
-                    });
+    <!-- 総合スコア -->
+    <div class="bg-slate-800/60 rounded-2xl p-8 mb-6 text-center">
+      <div class="score-ring mx-auto mb-3" id="overallRing">
+        <div class="score-inner">
+          <span id="overallScore" class="text-4xl font-black text-slate-800"></span>
+          <span class="text-xs text-slate-500">/ 100</span>
+        </div>
+      </div>
+      <h3 class="text-xl font-bold">総合スコア</h3>
+      <p class="text-sm text-slate-400 mt-1">GPT-5 × MediaPipe骨格データによる分析</p>
+    </div>
 
-                    const result = await response.json();
+    <!-- 4項目スコア -->
+    <div class="grid grid-cols-2 gap-4 mb-6">
+      <div class="bg-slate-800/60 rounded-xl p-5 text-center">
+        <i class="fas fa-male text-blue-400 text-2xl mb-2"></i>
+        <p class="text-xs text-slate-400 mb-1">姿勢・体幹</p>
+        <p class="text-3xl font-black"><span id="postureScore"></span><span class="text-base text-slate-400">点</span></p>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-5 text-center">
+        <i class="fas fa-shoe-prints text-green-400 text-2xl mb-2"></i>
+        <p class="text-xs text-slate-400 mb-1">ストライド</p>
+        <p class="text-3xl font-black"><span id="strideScore"></span><span class="text-base text-slate-400">点</span></p>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-5 text-center">
+        <i class="fas fa-hands text-purple-400 text-2xl mb-2"></i>
+        <p class="text-xs text-slate-400 mb-1">腕振り</p>
+        <p class="text-3xl font-black"><span id="armScore"></span><span class="text-base text-slate-400">点</span></p>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-5 text-center">
+        <i class="fas fa-walking text-orange-400 text-2xl mb-2"></i>
+        <p class="text-xs text-slate-400 mb-1">着地</p>
+        <p class="text-3xl font-black"><span id="footScore"></span><span class="text-base text-slate-400">点</span></p>
+      </div>
+    </div>
 
-                    if (result.success) {
-                        document.getElementById('progressBar').style.width = '100%';
-                        currentAnalysisId = result.analysisId;
-                        
-                        // 分析結果セクションを表示
-                        setTimeout(() => {
-                            document.getElementById('uploadProgress').classList.add('hidden');
-                            document.getElementById('analysisResult').classList.remove('hidden');
-                            pollAnalysisResult(currentAnalysisId);
-                        }, 500);
-                    } else {
-                        alert('アップロードに失敗しました: ' + result.error);
-                        document.getElementById('uploadProgress').classList.add('hidden');
-                        document.getElementById('selectedFile').classList.remove('hidden');
-                    }
-                } catch (error) {
-                    console.error('Upload error:', error);
-                    alert('アップロードに失敗しました');
-                    document.getElementById('uploadProgress').classList.add('hidden');
-                    document.getElementById('selectedFile').classList.remove('hidden');
-                }
-            }
+    <!-- 計測データ -->
+    <div id="metricsCard" class="bg-slate-800/60 rounded-2xl p-6 mb-6">
+      <h4 class="font-bold mb-4 text-slate-200"><i class="fas fa-ruler text-cyan-400 mr-2"></i>実測値サマリー</h4>
+      <div id="metricsGrid" class="grid grid-cols-2 gap-3 text-sm"></div>
+    </div>
 
-            // 分析結果をポーリング
-            async function pollAnalysisResult(analysisId) {
-                const maxAttempts = 60; // より長い待機時間（AI分析用）
-                let attempts = 0;
+    <!-- 良い点 -->
+    <div class="bg-slate-800/60 rounded-2xl p-6 mb-6">
+      <h4 class="font-bold mb-4 text-green-400"><i class="fas fa-check-circle mr-2"></i>良い点</h4>
+      <ul id="strengthsList" class="space-y-3"></ul>
+    </div>
 
-                const poll = async () => {
-                    try {
-                        const response = await fetch(\`/api/analysis/\${analysisId}\`);
-                        const analysis = await response.json();
+    <!-- 改善点 -->
+    <div class="bg-slate-800/60 rounded-2xl p-6 mb-6">
+      <h4 class="font-bold mb-4 text-yellow-400"><i class="fas fa-lightbulb mr-2"></i>改善点</h4>
+      <ul id="improvementsList" class="space-y-3"></ul>
+    </div>
 
-                        if (analysis.status === 'completed') {
-                            displayAnalysisResult(analysis);
-                        } else if (analysis.status === 'error') {
-                            document.getElementById('analysisLoading').innerHTML = \`
-                                <div class="text-center text-red-600">
-                                    <i class="fas fa-exclamation-circle text-4xl mb-4"></i>
-                                    <p class="font-medium">分析中にエラーが発生しました</p>
-                                    <p class="text-sm mt-2">\${analysis.error_message || '不明なエラー'}</p>
-                                </div>
-                            \`;
-                        } else if (attempts < maxAttempts) {
-                            attempts++;
-                            setTimeout(poll, 2000);
-                        } else {
-                            document.getElementById('analysisLoading').innerHTML = \`
-                                <div class="text-center text-yellow-600">
-                                    <i class="fas fa-clock text-4xl mb-4"></i>
-                                    <p class="font-medium">分析に時間がかかっています...</p>
-                                    <p class="text-sm mt-2">もうしばらくお待ちください</p>
-                                </div>
-                            \`;
-                        }
-                    } catch (error) {
-                        console.error('Poll error:', error);
-                    }
-                };
+    <!-- 詳細フィードバック -->
+    <div class="bg-gradient-to-br from-blue-900/50 to-purple-900/50 rounded-2xl p-6 mb-6">
+      <h4 class="font-bold mb-4 text-blue-300"><i class="fas fa-comment-alt mr-2"></i>AI詳細フィードバック</h4>
+      <pre id="detailedFeedback" class="whitespace-pre-wrap text-slate-300 text-sm leading-relaxed"></pre>
+    </div>
 
-                poll();
-            }
+    <!-- もう一度 -->
+    <button onclick="resetApp()" class="w-full bg-slate-700 hover:bg-slate-600 py-3 rounded-xl font-semibold transition-colors">
+      <i class="fas fa-redo mr-2"></i>別の動画を分析する
+    </button>
+  </section>
 
-            // 分析結果を表示
-            function displayAnalysisResult(analysis) {
-                document.getElementById('analysisLoading').classList.add('hidden');
-                document.getElementById('analysisContent').classList.remove('hidden');
+  <!-- エラー表示 -->
+  <div id="errorBox" class="hidden bg-red-900/60 rounded-2xl p-6 text-center">
+    <i class="fas fa-exclamation-circle text-3xl text-red-400 mb-3"></i>
+    <p id="errorMsg" class="text-red-300"></p>
+    <button onclick="resetApp()" class="mt-4 bg-red-800 hover:bg-red-700 px-6 py-2 rounded-lg text-sm">やり直す</button>
+  </div>
 
-                // スコア表示
-                document.getElementById('overallScore').textContent = analysis.overall_score;
-                document.getElementById('overallScoreCircle').style.setProperty('--score', analysis.overall_score);
-                document.getElementById('postureScore').textContent = analysis.posture_score;
-                document.getElementById('strideScore').textContent = analysis.stride_score;
-                document.getElementById('armSwingScore').textContent = analysis.arm_swing_score;
-                document.getElementById('footStrikeScore').textContent = analysis.foot_strike_score;
+</div>
 
-                // 良い点
-                const strengthsList = document.getElementById('strengthsList');
-                strengthsList.innerHTML = '';
-                analysis.strengths.forEach(strength => {
-                    const li = document.createElement('li');
-                    li.className = 'flex items-start';
-                    li.innerHTML = \`
-                        <i class="fas fa-check text-green-600 mr-3 mt-1"></i>
-                        <span class="text-gray-700">\${strength}</span>
-                    \`;
-                    strengthsList.appendChild(li);
-                });
+<!-- MediaPipe Tasks Vision (CDN) -->
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils }
+  from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs'
 
-                // 改善点
-                const improvementsList = document.getElementById('improvementsList');
-                improvementsList.innerHTML = '';
-                analysis.improvements.forEach(improvement => {
-                    const li = document.createElement('li');
-                    li.className = 'flex items-start';
-                    li.innerHTML = \`
-                        <i class="fas fa-arrow-right text-yellow-600 mr-3 mt-1"></i>
-                        <span class="text-gray-700">\${improvement}</span>
-                    \`;
-                    improvementsList.appendChild(li);
-                });
+// ==========================================
+// グローバル状態
+// ==========================================
+let poseLandmarker = null
+let selectedFile   = null
+let analysisId     = null
+let poseFrames     = []      // 全フレームの角度データ
+let drawUtils      = null
 
-                // 詳細フィードバック
-                document.getElementById('detailedFeedback').textContent = analysis.detailed_feedback;
-            }
-        </script>
-    </body>
-    </html>
-  `)
+// ==========================================
+// ファイル選択
+// ==========================================
+document.getElementById('videoInput').addEventListener('change', e => {
+  const file = e.target.files[0]
+  if (!file) return
+  selectedFile = file
+  document.getElementById('fileName').textContent = file.name
+  document.getElementById('fileSize').textContent = (file.size / 1024 / 1024).toFixed(2) + ' MB'
+  document.getElementById('fileInfo').classList.remove('hidden')
+})
+
+// ==========================================
+// MediaPipe 初期化
+// ==========================================
+async function initMediaPipe(onProgress) {
+  onProgress(10, 'WASMファイルを読み込み中...')
+  const vision = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+  )
+  onProgress(50, 'Poseモデルをロード中...')
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+      delegate: 'GPU',
+    },
+    runningMode:            'VIDEO',
+    numPoses:               1,
+    minPoseDetectionConfidence: 0.5,
+    minPosePresenceConfidence:  0.5,
+    minTrackingConfidence:      0.5,
+  })
+  onProgress(100, 'MediaPipe 準備完了')
+}
+
+// ==========================================
+// 角度計算ユーティリティ
+// ==========================================
+function angle3(a, b, c) {
+  // b が頂点
+  const v1 = { x: a.x - b.x, y: a.y - b.y }
+  const v2 = { x: c.x - b.x, y: c.y - b.y }
+  const dot  = v1.x * v2.x + v1.y * v2.y
+  const mag  = Math.sqrt((v1.x**2 + v1.y**2) * (v2.x**2 + v2.y**2))
+  if (mag === 0) return 0
+  return (Math.acos(Math.max(-1, Math.min(1, dot / mag))) * 180) / Math.PI
+}
+
+function extractAngles(lm) {
+  // 33点ランドマーク配列からインデックスで取得
+  const L = i => lm[i]
+  return {
+    leftKnee:      angle3(L(23), L(25), L(27)),
+    rightKnee:     angle3(L(24), L(26), L(28)),
+    leftElbow:     angle3(L(11), L(13), L(15)),
+    rightElbow:    angle3(L(12), L(14), L(16)),
+    trunkLean:     angle3(L(23), L(11), { x: L(11).x, y: 0 }),  // 肩から垂直への角度
+    leftHipAngle:  angle3(L(11), L(23), L(25)),
+    rightHipAngle: angle3(L(12), L(24), L(26)),
+  }
+}
+
+function detectFootStrike(frames) {
+  if (frames.length === 0) return 'unknown'
+  const avgKnee = frames.reduce((s, f) =>
+    s + (f.angles.leftKnee + f.angles.rightKnee) / 2, 0) / frames.length
+  if (avgKnee > 165) return 'heel'
+  if (avgKnee > 150) return 'midfoot'
+  return 'forefoot'
+}
+
+function avgAngles(frames) {
+  if (frames.length === 0) return null
+  const keys = Object.keys(frames[0].angles)
+  const result = {}
+  for (const k of keys) {
+    result[k] = frames.reduce((s, f) => s + f.angles[k], 0) / frames.length
+  }
+  return result
+}
+
+function minMaxAngles(frames) {
+  const keys = Object.keys(frames[0].angles)
+  const mn = {}, mx = {}
+  for (const k of keys) {
+    const vals = frames.map(f => f.angles[k])
+    mn[k] = Math.min(...vals)
+    mx[k] = Math.max(...vals)
+  }
+  return { min: mn, max: mx }
+}
+
+function symmetryScore(frames) {
+  if (frames.length === 0) return 0
+  const diffs = frames.map(f =>
+    Math.abs(f.angles.leftKnee  - f.angles.rightKnee) +
+    Math.abs(f.angles.leftElbow - f.angles.rightElbow)
+  )
+  const avgDiff = diffs.reduce((s, d) => s + d, 0) / diffs.length
+  return Math.max(0, 1 - avgDiff / 90)
+}
+
+function trunkStability(frames) {
+  if (frames.length < 2) return 1
+  const leans = frames.map(f => f.angles.trunkLean)
+  const mean  = leans.reduce((s, v) => s + v, 0) / leans.length
+  const variance = leans.reduce((s, v) => s + (v - mean) ** 2, 0) / leans.length
+  return variance < 1 ? 10 : 1 / Math.sqrt(variance)
+}
+
+// ==========================================
+// サンプルフレーム均等抽出
+// ==========================================
+function sampleFrames(frames, n = 10) {
+  if (frames.length <= n) return frames
+  const step = Math.floor(frames.length / n)
+  return Array.from({ length: n }, (_, i) => frames[i * step])
+}
+
+// ==========================================
+// メイン解析フロー
+// ==========================================
+window.startAnalysis = async function() {
+  if (!selectedFile) return
+  poseFrames = []
+
+  show('progressSection')
+  hide('uploadSection')
+  hide('errorBox')
+
+  const wasmBar    = document.getElementById('wasmBar')
+  const wasmStatus = document.getElementById('wasmStatus')
+  const wasmPct    = document.getElementById('wasmPct')
+
+  // プログレスコールバック
+  const onProgress = (pct, msg) => {
+    wasmBar.style.width    = pct + '%'
+    wasmPct.textContent    = pct + '%'
+    wasmStatus.textContent = msg
+  }
+
+  try {
+    await initMediaPipe(onProgress)
+  } catch (e) {
+    showError('MediaPipeの読み込みに失敗しました: ' + e.message)
+    return
+  }
+
+  // 動画をcanvasに描画しながらフレーム処理
+  const video  = document.getElementById('previewVideo')
+  const canvas = document.getElementById('skeletonCanvas')
+  const ctx    = canvas.getContext('2d')
+  drawUtils = new DrawingUtils(ctx)
+
+  const url = URL.createObjectURL(selectedFile)
+  video.src = url
+
+  await new Promise(res => video.addEventListener('loadedmetadata', res, { once: true }))
+
+  canvas.width  = video.videoWidth
+  canvas.height = video.videoHeight
+
+  const frameCounter = document.getElementById('frameCounter')
+  const FPS_SAMPLE   = 10   // 解析する疑似FPS
+  const duration     = video.duration
+  let   t            = 0
+  let   frameCount   = 0
+
+  // フレームごとに seek → detect
+  onProgress(100, '骨格を検出中...')
+
+  while (t < duration) {
+    video.currentTime = t
+    await new Promise(res => video.addEventListener('seeked', res, { once: true }))
+
+    // Canvas に描画
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+    const result = poseLandmarker.detectForVideo(video, t * 1000)
+
+    if (result.landmarks && result.landmarks.length > 0) {
+      const lm = result.landmarks[0]
+      const wlm = result.worldLandmarks[0]
+
+      // 骨格を描画
+      drawUtils.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: '#00FF88', lineWidth: 2 })
+      drawUtils.drawLandmarks(lm, { color: '#FF3366', radius: 4 })
+
+      const angles = extractAngles(lm)
+      poseFrames.push({ timestamp: t, landmarks: lm, angles })
+      frameCount++
+      frameCounter.textContent = 'フレーム処理中: ' + frameCount
+    }
+
+    t += 1 / FPS_SAMPLE
+  }
+
+  if (poseFrames.length === 0) {
+    showError('骨格を検出できませんでした。人物が映っている動画をご使用ください。')
+    return
+  }
+
+  // サマリー生成
+  const avg  = avgAngles(poseFrames)
+  const { min, max } = minMaxAngles(poseFrames)
+  const summary = {
+    frameCount:       poseFrames.length,
+    fps:              FPS_SAMPLE,
+    duration:         duration,
+    avgAngles:        avg,
+    minAngles:        min,
+    maxAngles:        max,
+    symmetryScore:    symmetryScore(poseFrames),
+    cadenceEstimate:  0,
+    trunkStability:   trunkStability(poseFrames),
+    footStrikePattern: detectFootStrike(poseFrames),
+  }
+
+  onProgress(100, 'GPT-5に送信中...')
+  wasmStatus.textContent = 'GPT-5が分析中...'
+
+  // バックエンドへ送信
+  try {
+    const res = await fetch('/api/analyze-pose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ summary, sampleFrames: sampleFrames(poseFrames, 10) }),
+    })
+    const json = await res.json()
+    if (!json.success) throw new Error(json.error)
+    analysisId = json.analysisId
+    pollResult(analysisId, summary)
+  } catch (e) {
+    showError('分析リクエストに失敗しました: ' + e.message)
+  }
+}
+
+// ==========================================
+// ポーリング
+// ==========================================
+async function pollResult(id, summary, attempt = 0) {
+  if (attempt > 60) { showError('分析がタイムアウトしました'); return }
+  const res  = await fetch('/api/analysis/' + id)
+  const data = await res.json()
+
+  if (data.status === 'completed') {
+    showResult(data, summary)
+  } else if (data.status === 'error') {
+    showError(data.error_message || '分析中にエラーが発生しました')
+  } else {
+    setTimeout(() => pollResult(id, summary, attempt + 1), 2000)
+  }
+}
+
+// ==========================================
+// 結果表示
+// ==========================================
+function showResult(data, summary) {
+  hide('progressSection')
+  show('resultSection')
+
+  // スコア
+  document.getElementById('overallRing').style.setProperty('--pct', data.overall_score)
+  document.getElementById('overallScore').textContent  = data.overall_score
+  document.getElementById('postureScore').textContent  = data.posture_score
+  document.getElementById('strideScore').textContent   = data.stride_score
+  document.getElementById('armScore').textContent      = data.arm_swing_score
+  document.getElementById('footScore').textContent     = data.foot_strike_score
+
+  // 実測値サマリー
+  const metrics = [
+    ['体幹前傾角', summary.avgAngles.trunkLean.toFixed(1) + '°（理想: 5〜10°）'],
+    ['左膝平均角', summary.avgAngles.leftKnee.toFixed(1) + '°'],
+    ['右膝平均角', summary.avgAngles.rightKnee.toFixed(1) + '°'],
+    ['左右対称性', (summary.symmetryScore * 100).toFixed(1) + '%'],
+    ['体幹安定度', summary.trunkStability.toFixed(2)],
+    ['着地パターン', summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット'],
+    ['解析フレーム数', summary.frameCount + ' フレーム'],
+    ['動画時間', summary.duration.toFixed(1) + ' 秒'],
+  ]
+  document.getElementById('metricsGrid').innerHTML = metrics.map(([k, v]) => \`
+    <div class="bg-slate-700/50 rounded-lg p-3">
+      <p class="text-slate-400 text-xs mb-1">\${k}</p>
+      <p class="font-semibold text-white text-sm">\${v}</p>
+    </div>
+  \`).join('')
+
+  // 良い点
+  document.getElementById('strengthsList').innerHTML =
+    data.strengths.map(s => \`
+      <li class="flex items-start gap-2">
+        <i class="fas fa-check text-green-400 mt-1 flex-shrink-0"></i>
+        <span class="text-slate-300 text-sm">\${s}</span>
+      </li>
+    \`).join('')
+
+  // 改善点
+  document.getElementById('improvementsList').innerHTML =
+    data.improvements.map(s => \`
+      <li class="flex items-start gap-2">
+        <i class="fas fa-arrow-right text-yellow-400 mt-1 flex-shrink-0"></i>
+        <span class="text-slate-300 text-sm">\${s}</span>
+      </li>
+    \`).join('')
+
+  // 詳細フィードバック
+  document.getElementById('detailedFeedback').textContent = data.detailed_feedback
+}
+
+// ==========================================
+// ユーティリティ
+// ==========================================
+function show(id) { document.getElementById(id).classList.remove('hidden') }
+function hide(id) { document.getElementById(id).classList.add('hidden') }
+
+function showError(msg) {
+  hide('progressSection')
+  document.getElementById('errorMsg').textContent = msg
+  show('errorBox')
+}
+
+window.resetApp = function() {
+  poseFrames = []; selectedFile = null; analysisId = null
+  hide('progressSection'); hide('resultSection'); hide('errorBox')
+  show('uploadSection')
+  document.getElementById('fileInfo').classList.add('hidden')
+  document.getElementById('videoInput').value = ''
+}
+</script>
+
+</body>
+</html>`)
 })
 
 export default app
