@@ -250,6 +250,13 @@ app.get('/', (c) => {
     @keyframes spin { to { transform: rotate(360deg); } }
     #skeletonCanvas { position: absolute; top:0; left:0; pointer-events:none; }
     #reviewCanvas   { position: absolute; top:0; left:0; pointer-events:none; width:100%; height:100%; }
+    #cameraCanvas   { position: absolute; top:0; left:0; pointer-events:none; width:100%; height:100%; }
+    .tab-btn { transition: all .2s; }
+    .tab-btn.active { background:#3b82f6; color:white; }
+    .tab-btn:not(.active) { background:transparent; color:#94a3b8; }
+    .rec-dot { width:10px; height:10px; border-radius:50%; background:#ef4444;
+               animation: recblink 1s ease-in-out infinite; display:inline-block; }
+    @keyframes recblink { 0%,100%{opacity:1} 50%{opacity:.2} }
     .step-badge {
       width:28px; height:28px; border-radius:50%;
       background:#3b82f6; color:white; display:flex;
@@ -270,18 +277,19 @@ app.get('/', (c) => {
     <p class="text-slate-400">MediaPipe WASM によるブラウザ内ランニングフォーム分析</p>
   </header>
 
-  <!-- ステップ説明 -->
-  <div class="bg-slate-800/60 rounded-2xl p-5 mb-8 flex gap-4 text-sm text-slate-300">
-    <div class="flex items-start gap-2"><span class="step-badge">1</span><span>動画を選択</span></div>
-    <div class="text-slate-600 self-center">→</div>
-    <div class="flex items-start gap-2"><span class="step-badge">2</span><span>WASM骨格検出</span></div>
-    <div class="text-slate-600 self-center">→</div>
-    <div class="flex items-start gap-2"><span class="step-badge">3</span><span>角度・対称性を計算</span></div>
-    <div class="text-slate-600 self-center">→</div>
-    <div class="flex items-start gap-2"><span class="step-badge">4</span><span>結果表示</span></div>
+  <!-- タブ切替 -->
+  <div class="bg-slate-800/60 rounded-2xl p-1.5 mb-6 flex gap-1">
+    <button id="tabFileBtn" onclick="switchTab('file')"
+      class="tab-btn active flex-1 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2">
+      <i class="fas fa-file-video"></i>動画ファイル
+    </button>
+    <button id="tabCamBtn" onclick="switchTab('camera')"
+      class="tab-btn flex-1 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2">
+      <i class="fas fa-camera"></i>カメラ録画
+    </button>
   </div>
 
-  <!-- アップロードエリア -->
+  <!-- ─── 動画ファイルタブ ─── -->
   <section id="uploadSection" class="bg-slate-800/60 rounded-2xl p-8 mb-6">
     <h2 class="text-xl font-bold mb-5"><i class="fas fa-video text-blue-400 mr-2"></i>動画を選択</h2>
     <label for="videoInput"
@@ -303,8 +311,62 @@ app.get('/', (c) => {
       </div>
       <button id="analyzeBtn" onclick="startAnalysis()"
         class="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg font-semibold text-sm transition-colors">
-        <i class="fas fa-brain mr-2"></i>WASM骨格解析スタート
+        <i class="fas fa-brain mr-2"></i>骨格解析スタート
       </button>
+    </div>
+  </section>
+
+  <!-- ─── カメラ録画タブ ─── -->
+  <section id="cameraSection" class="hidden bg-slate-800/60 rounded-2xl p-6 mb-6">
+    <h2 class="text-xl font-bold mb-4">
+      <i class="fas fa-camera text-red-400 mr-2"></i>カメラでリアルタイム分析・録画
+    </h2>
+
+    <!-- カメラ映像 + 骨格オーバーレイ -->
+    <div class="relative rounded-xl overflow-hidden bg-black aspect-video mb-4">
+      <video id="cameraVideo" class="w-full h-full object-contain" muted playsinline autoplay></video>
+      <canvas id="cameraCanvas"></canvas>
+      <!-- REC バッジ -->
+      <div id="recBadge" class="hidden absolute top-3 left-3 bg-black/70 rounded-lg px-3 py-1.5 flex items-center gap-2 text-sm font-bold">
+        <span class="rec-dot"></span>REC
+        <span id="recTimer" class="tabular-nums text-red-300 ml-1">0:00</span>
+      </div>
+      <!-- リアルタイムスコア -->
+      <div id="liveScoreOverlay" class="hidden absolute top-3 right-3 bg-black/70 rounded-lg px-3 py-2 text-xs space-y-0.5">
+        <div class="flex justify-between gap-4"><span class="text-slate-400">左膝</span><span id="camLeftKnee" class="text-cyan-300 font-bold tabular-nums">—</span></div>
+        <div class="flex justify-between gap-4"><span class="text-slate-400">右膝</span><span id="camRightKnee" class="text-cyan-300 font-bold tabular-nums">—</span></div>
+        <div class="flex justify-between gap-4"><span class="text-slate-400">体幹</span><span id="camTrunk" class="text-orange-300 font-bold tabular-nums">—</span></div>
+        <div class="flex justify-between gap-4"><span class="text-slate-400">肘</span><span id="camElbow" class="text-purple-300 font-bold tabular-nums">—</span></div>
+        <div class="flex justify-between gap-4"><span class="text-slate-400">対称</span><span id="camSym" class="text-green-300 font-bold tabular-nums">—</span></div>
+      </div>
+    </div>
+
+    <!-- カメラ読み込み中 -->
+    <div id="cameraLoading" class="text-center text-slate-400 text-sm mb-4">
+      <i class="fas fa-circle-notch fa-spin mr-2"></i>カメラを準備中...
+    </div>
+
+    <!-- コントロール -->
+    <div id="cameraControls" class="hidden space-y-3">
+      <!-- カメラ選択 -->
+      <div class="flex items-center gap-3">
+        <label class="text-sm text-slate-400 w-20 flex-shrink-0">カメラ</label>
+        <select id="cameraSelect" onchange="switchCamera(this.value)"
+          class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white">
+        </select>
+      </div>
+      <!-- ボタン -->
+      <div class="flex gap-3">
+        <button id="startRecBtn" onclick="startCameraRec()"
+          class="flex-1 bg-red-600 hover:bg-red-500 py-3 rounded-xl font-bold text-sm transition-colors flex items-center justify-center gap-2">
+          <span class="rec-dot"></span>録画開始
+        </button>
+        <button id="stopRecBtn" onclick="stopCameraRec()" disabled
+          class="flex-1 bg-slate-600 py-3 rounded-xl font-bold text-sm transition-colors opacity-50 cursor-not-allowed flex items-center justify-center gap-2">
+          <i class="fas fa-stop"></i>録画停止・分析
+        </button>
+      </div>
+      <p class="text-xs text-slate-500 text-center">録画停止後、自動的に骨格解析して結果を表示します</p>
     </div>
   </section>
 
@@ -479,6 +541,14 @@ app.get('/', (c) => {
       <pre id="detailedFeedback" class="whitespace-pre-wrap text-slate-300 text-sm leading-relaxed"></pre>
     </div>
 
+    <!-- ダウンロード（カメラ録画時のみ表示） -->
+    <div id="downloadBtnWrap" class="hidden mb-3">
+      <button onclick="downloadRecording()"
+        class="w-full bg-green-700 hover:bg-green-600 py-3 rounded-xl font-semibold transition-colors">
+        <i class="fas fa-download mr-2"></i>録画動画をダウンロード保存
+      </button>
+    </div>
+
     <!-- もう一度 -->
     <button onclick="resetApp()" class="w-full bg-slate-700 hover:bg-slate-600 py-3 rounded-xl font-semibold transition-colors">
       <i class="fas fa-redo mr-2"></i>別の動画を分析する
@@ -512,8 +582,219 @@ let drawUtils      = null
 let reviewDrawUtils   = null
 let reviewCtx         = null
 let reviewOverlayOn   = true
-let reviewRafId       = null   // requestAnimationFrame ID
+let reviewRafId       = null
 let reviewVideoUrl    = null
+
+// カメラ・録画用
+let cameraStream      = null   // MediaStream
+let mediaRecorder     = null   // MediaRecorder
+let recordedChunks    = []     // 録画データ
+let cameraRafId       = null   // requestAnimationFrame ID
+let cameraDrawUtils   = null
+let recStartTime      = null   // 録画開始時刻
+let recTimerInterval  = null   // タイマー更新用
+let currentDeviceId   = null   // 選択中カメラID
+
+// ==========================================
+// タブ切替
+// ==========================================
+window.switchTab = function(tab) {
+  const isFile = tab === 'file'
+  document.getElementById('tabFileBtn').classList.toggle('active', isFile)
+  document.getElementById('tabCamBtn').classList.toggle('active', !isFile)
+  document.getElementById('uploadSection').classList.toggle('hidden', !isFile)
+  document.getElementById('cameraSection').classList.toggle('hidden', isFile)
+  if (!isFile) initCamera()
+  else stopCamera()
+}
+
+// ==========================================
+// カメラ初期化・デバイス列挙
+// ==========================================
+async function initCamera() {
+  // MediaPipe が未ロードなら先にロード
+  if (!poseLandmarker) {
+    document.getElementById('cameraLoading').textContent = 'MediaPipe WASMを読み込み中...'
+    try {
+      await initMediaPipe((pct, msg) => {
+        document.getElementById('cameraLoading').textContent = msg
+      })
+    } catch(e) {
+      document.getElementById('cameraLoading').textContent = 'MediaPipeの読み込みに失敗: ' + e.message
+      return
+    }
+  }
+
+  // カメラ一覧を取得
+  try {
+    // まず一時パーミッション取得
+    const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    tmp.getTracks().forEach(t => t.stop())
+
+    const devices = await navigator.mediaDevices.enumerateDevices()
+    const cams = devices.filter(d => d.kind === 'videoinput')
+    const sel = document.getElementById('cameraSelect')
+    sel.innerHTML = cams.map((d, i) =>
+      \`<option value="\${d.deviceId}">\${d.label || 'カメラ ' + (i+1)}</option>\`
+    ).join('')
+    currentDeviceId = cams[0]?.deviceId || null
+    await openCamera(currentDeviceId)
+  } catch(e) {
+    document.getElementById('cameraLoading').textContent = 'カメラへのアクセスが拒否されました: ' + e.message
+  }
+}
+
+async function openCamera(deviceId) {
+  // 既存ストリームを停止
+  if (cameraStream) cameraStream.getTracks().forEach(t => t.stop())
+  if (cameraRafId)  { cancelAnimationFrame(cameraRafId); cameraRafId = null }
+
+  const constraints = {
+    video: deviceId ? { deviceId: { exact: deviceId } } : true,
+    audio: true,
+  }
+  cameraStream = await navigator.mediaDevices.getUserMedia(constraints)
+
+  const cv = document.getElementById('cameraVideo')
+  cv.srcObject = cameraStream
+  await new Promise(res => cv.addEventListener('loadedmetadata', res, { once: true }))
+  cv.play()
+
+  // canvasサイズ合わせ
+  const cc = document.getElementById('cameraCanvas')
+  cc.width  = cv.videoWidth  || 640
+  cc.height = cv.videoHeight || 480
+
+  cameraDrawUtils = new DrawingUtils(cc.getContext('2d'))
+
+  document.getElementById('cameraLoading').classList.add('hidden')
+  document.getElementById('cameraControls').classList.remove('hidden')
+  document.getElementById('liveScoreOverlay').classList.remove('hidden')
+
+  // リアルタイム骨格描画ループ開始
+  startCameraLoop()
+}
+
+function startCameraLoop() {
+  const cv  = document.getElementById('cameraVideo')
+  const cc  = document.getElementById('cameraCanvas')
+  const ctx = cc.getContext('2d')
+
+  function loop() {
+    cameraRafId = requestAnimationFrame(loop)
+    if (cv.readyState < 2) return
+
+    ctx.clearRect(0, 0, cc.width, cc.height)
+    const result = poseLandmarker.detectForVideo(cv, performance.now())
+    if (result.landmarks?.length > 0) {
+      const lm = result.landmarks[0]
+      cameraDrawUtils.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS,
+        { color: '#00FF88', lineWidth: 2 })
+      cameraDrawUtils.drawLandmarks(lm, { color: '#FF3366', radius: 3 })
+
+      // 角度計算してオーバーレイ更新
+      const ang = extractAngles(lm)
+      const sym = Math.max(0, 1 - (
+        Math.abs(ang.leftKnee  - ang.rightKnee)  +
+        Math.abs(ang.leftElbow - ang.rightElbow)
+      ) / 90) * 100
+      document.getElementById('camLeftKnee').textContent  = ang.leftKnee.toFixed(1)  + '°'
+      document.getElementById('camRightKnee').textContent = ang.rightKnee.toFixed(1) + '°'
+      document.getElementById('camTrunk').textContent     = ang.trunkLean.toFixed(1) + '°'
+      document.getElementById('camElbow').textContent     =
+        ((ang.leftElbow + ang.rightElbow) / 2).toFixed(1) + '°'
+      document.getElementById('camSym').textContent       = sym.toFixed(1) + '%'
+
+      // キャンバスに角度テキストも描く
+      drawAngleLabels(ctx, lm, ang, cc.width, cc.height)
+    }
+  }
+  loop()
+}
+
+// カメラ切替
+window.switchCamera = async function(deviceId) {
+  currentDeviceId = deviceId
+  await openCamera(deviceId)
+}
+
+// カメラ停止（タブ離脱時）
+function stopCamera() {
+  if (cameraRafId)  { cancelAnimationFrame(cameraRafId); cameraRafId = null }
+  if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null }
+  if (recTimerInterval) { clearInterval(recTimerInterval); recTimerInterval = null }
+  document.getElementById('cameraLoading').classList.remove('hidden')
+  document.getElementById('cameraLoading').textContent = 'カメラを準備中...'
+  document.getElementById('cameraControls').classList.add('hidden')
+  document.getElementById('liveScoreOverlay').classList.add('hidden')
+}
+
+// ==========================================
+// 録画開始
+// ==========================================
+window.startCameraRec = function() {
+  if (!cameraStream) return
+  recordedChunks = []
+
+  // サポートするMIMEタイプを選択
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']
+    .find(m => MediaRecorder.isTypeSupported(m)) || ''
+
+  mediaRecorder = new MediaRecorder(cameraStream, mime ? { mimeType: mime } : {})
+  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data) }
+  mediaRecorder.start(100)   // 100ms ごとにチャンク
+
+  recStartTime = Date.now()
+  document.getElementById('recBadge').classList.remove('hidden')
+  document.getElementById('startRecBtn').disabled = true
+  document.getElementById('startRecBtn').classList.add('opacity-50', 'cursor-not-allowed')
+  document.getElementById('stopRecBtn').disabled  = false
+  document.getElementById('stopRecBtn').classList.remove('opacity-50', 'cursor-not-allowed')
+
+  // タイマー表示
+  recTimerInterval = setInterval(() => {
+    const s = Math.floor((Date.now() - recStartTime) / 1000)
+    const mm = String(Math.floor(s / 60)).padStart(1, '0')
+    const ss = String(s % 60).padStart(2, '0')
+    document.getElementById('recTimer').textContent = mm + ':' + ss
+  }, 500)
+}
+
+// ==========================================
+// 録画停止 → 分析へ
+// ==========================================
+window.stopCameraRec = function() {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return
+
+  mediaRecorder.stop()
+  clearInterval(recTimerInterval)
+  document.getElementById('recBadge').classList.add('hidden')
+  document.getElementById('startRecBtn').disabled = false
+  document.getElementById('startRecBtn').classList.remove('opacity-50', 'cursor-not-allowed')
+  document.getElementById('stopRecBtn').disabled  = true
+  document.getElementById('stopRecBtn').classList.add('opacity-50', 'cursor-not-allowed')
+
+  // カメラループを止めてストリームも解放
+  if (cameraRafId) { cancelAnimationFrame(cameraRafId); cameraRafId = null }
+  if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null }
+
+  mediaRecorder.onstop = async () => {
+    const mime = recordedChunks[0]?.type || 'video/webm'
+    const blob = new Blob(recordedChunks, { type: mime })
+    const ext  = mime.includes('mp4') ? 'mp4' : 'webm'
+
+    // File オブジェクトに変換して既存の分析フローへ
+    selectedFile = new File([blob], \`camera-rec-\${Date.now()}.\${ext}\`, { type: mime })
+
+    // カメラUIを隠してファイルタブに切替（内部的に）
+    hide('cameraSection')
+    document.getElementById('tabFileBtn').classList.add('active')
+    document.getElementById('tabCamBtn').classList.remove('active')
+
+    // 分析開始
+    await startAnalysis()
+  }
+}
 
 // ==========================================
 // ファイル選択
@@ -860,6 +1141,10 @@ function showResult(data, summary) {
   hide('progressSection')
   show('resultSection')
 
+  // カメラ録画由来なら「ダウンロード」ボタンを表示
+  const isRecorded = selectedFile?.name?.startsWith('camera-rec-')
+  document.getElementById('downloadBtnWrap').classList.toggle('hidden', !isRecorded)
+
   // スコア
   document.getElementById('overallRing').style.setProperty('--pct', data.overall_score)
   document.getElementById('overallScore').textContent  = data.overall_score
@@ -1087,12 +1372,30 @@ window.resetApp = function() {
   if (reviewVideoUrl) { URL.revokeObjectURL(reviewVideoUrl); reviewVideoUrl = null }
   if (reviewRafId)    { cancelAnimationFrame(reviewRafId); reviewRafId = null }
 
-  poseFrames = []; selectedFile = null; analysisId = null
+  // カメラ停止
+  stopCamera()
+
+  poseFrames = []; selectedFile = null; analysisId = null; recordedChunks = []
   hide('progressSection'); hide('resultSection'); hide('errorBox')
+  hide('cameraSection')
   show('uploadSection')
   document.getElementById('fileInfo').classList.add('hidden')
   document.getElementById('videoInput').value = ''
   document.getElementById('playPauseBtn').innerHTML = '<i class="fas fa-play mr-1"></i>再生'
+  // タブをファイルに戻す
+  document.getElementById('tabFileBtn').classList.add('active')
+  document.getElementById('tabCamBtn').classList.remove('active')
+}
+
+// 録画済み動画をダウンロード
+window.downloadRecording = function() {
+  if (!selectedFile) return
+  const url = URL.createObjectURL(selectedFile)
+  const a   = document.createElement('a')
+  a.href     = url
+  a.download = selectedFile.name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 5000)
 }
 </script>
 
