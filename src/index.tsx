@@ -625,35 +625,116 @@ async function initCamera() {
     }
   }
 
-  // カメラ一覧を取得
-  try {
-    // まず一時パーミッション取得
-    const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    tmp.getTracks().forEach(t => t.stop())
+  // mediaDevices API の存在確認
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showCameraError(
+      'お使いのブラウザはカメラAPIに対応していません。',
+      'Chrome / Edge / Safari の最新版でお試しください。'
+    )
+    return
+  }
 
+  // video のみ → video+audio の順で段階的に試みる
+  const attempts = [
+    { video: true, audio: false },
+    { video: true, audio: true },
+  ]
+  let stream = null
+  let lastErr = null
+
+  for (const c of attempts) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(c)
+      break
+    } catch(e) {
+      lastErr = e
+      console.warn('getUserMedia attempt failed:', c, e.name, e.message)
+    }
+  }
+
+  if (!stream) {
+    const name = lastErr?.name || 'Error'
+    const msg  = lastErr?.message || ''
+    let hint = ''
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+      hint = [
+        '\u2460 このページを <strong>ブラウザで直接</strong> 開いてください（iframeプレビュー内では動作しません）',
+        '\u2461 URLをコピーして新しいタブに貼り付けてください',
+        '\u2462 ブラウザのアドレスバー左の \u{1F512} アイコンからカメラを「許可」してください',
+      ].join('<br>')
+    } else if (name === 'NotFoundError') {
+      hint = 'カメラデバイスが見つかりません。カメラが接続されているか確認してください。'
+    } else if (name === 'NotReadableError') {
+      hint = '別のアプリがカメラを使用中です。他のアプリを閉じてから再試行してください。'
+    } else if (location.protocol !== 'https:') {
+      hint = 'カメラはHTTPS接続が必要です。https:// のURLでアクセスしてください。'
+    }
+    showCameraError(name + (msg ? ': ' + msg : ''), hint)
+    return
+  }
+
+  // 成功 — デバイス一覧を取得
+  try {
     const devices = await navigator.mediaDevices.enumerateDevices()
     const cams = devices.filter(d => d.kind === 'videoinput')
     const sel = document.getElementById('cameraSelect')
-    sel.innerHTML = cams.map((d, i) =>
-      \`<option value="\${d.deviceId}">\${d.label || 'カメラ ' + (i+1)}</option>\`
-    ).join('')
+    sel.innerHTML = cams.length
+      ? cams.map((d, i) =>
+          '<option value="' + d.deviceId + '">' + (d.label || 'カメラ ' + (i+1)) + '</option>'
+        ).join('')
+      : '<option value="">デフォルトカメラ</option>'
     currentDeviceId = cams[0]?.deviceId || null
-    await openCamera(currentDeviceId)
-  } catch(e) {
-    document.getElementById('cameraLoading').textContent = 'カメラへのアクセスが拒否されました: ' + e.message
-  }
+  } catch(_) {}
+
+  await openCameraWithStream(stream)
 }
 
+function showCameraError(errorText, hint) {
+  const el = document.getElementById('cameraLoading')
+  el.classList.remove('hidden')
+  el.innerHTML = [
+    '<div class="py-2">',
+    '  <i class="fas fa-exclamation-triangle text-yellow-400 text-3xl mb-3"></i>',
+    '  <p class="text-red-300 font-bold mb-2">カメラを起動できませんでした</p>',
+    '  <p class="text-slate-400 text-xs font-mono mb-3">' + errorText + '</p>',
+    hint
+      ? '  <div class="text-left text-xs text-slate-300 bg-slate-700/70 rounded-xl p-4 mb-4 leading-relaxed">' + hint + '</div>'
+      : '',
+    '  <div class="text-xs text-slate-400 bg-slate-700/40 rounded-xl p-3 mb-4 text-left">',
+    '    <p class="font-bold text-slate-300 mb-1"><i class="fas fa-link mr-1"></i>直接URLで開く</p>',
+    '    <p class="font-mono text-blue-300 break-all select-all">' + location.href + '</p>',
+    '  </div>',
+    '  <button onclick="initCamera()" class="bg-blue-600 hover:bg-blue-500 px-6 py-2 rounded-lg text-sm font-semibold">',
+    '    <i class="fas fa-redo mr-1"></i>再試行',
+    '  </button>',
+    '</div>',
+  ].join('')
+}
+
+// カメラ切替用（デバイスID指定で再取得）
 async function openCamera(deviceId) {
-  // 既存ストリームを停止
   if (cameraStream) cameraStream.getTracks().forEach(t => t.stop())
   if (cameraRafId)  { cancelAnimationFrame(cameraRafId); cameraRafId = null }
 
-  const constraints = {
-    video: deviceId ? { deviceId: { exact: deviceId } } : true,
-    audio: true,
+  let stream = null
+  const attempts = [
+    { video: deviceId ? { deviceId: { exact: deviceId } } : true, audio: false },
+    { video: deviceId ? { deviceId: { exact: deviceId } } : true, audio: true  },
+  ]
+  for (const c of attempts) {
+    try { stream = await navigator.mediaDevices.getUserMedia(c); break }
+    catch(e) { console.warn('openCamera retry:', e.name) }
   }
-  cameraStream = await navigator.mediaDevices.getUserMedia(constraints)
+  if (!stream) { showCameraError('カメラの切り替えに失敗しました', ''); return }
+  await openCameraWithStream(stream)
+}
+
+// 取得済みストリームをセット＆ループ開始
+async function openCameraWithStream(stream) {
+  if (cameraStream) cameraStream.getTracks().forEach(t => t.stop())
+  if (cameraRafId)  { cancelAnimationFrame(cameraRafId); cameraRafId = null }
+
+  cameraStream = stream
 
   const cv = document.getElementById('cameraVideo')
   cv.srcObject = cameraStream
@@ -671,7 +752,6 @@ async function openCamera(deviceId) {
   document.getElementById('cameraControls').classList.remove('hidden')
   document.getElementById('liveScoreOverlay').classList.remove('hidden')
 
-  // リアルタイム骨格描画ループ開始
   startCameraLoop()
 }
 
