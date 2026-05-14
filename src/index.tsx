@@ -263,6 +263,23 @@ app.get('/', (c) => {
       align-items:center; justify-content:center;
       font-size:.8rem; font-weight:700; flex-shrink:0;
     }
+    .session-card {
+      transition: all .2s;
+    }
+    .session-card:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 20px rgba(59,130,246,.25);
+    }
+    .sim-bar {
+      height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, #3b82f6, #06b6d4);
+      transition: width .6s ease;
+    }
+    .save-badge {
+      display:inline-flex; align-items:center; gap:4px;
+      background:#16a34a; color:white; font-size:.7rem;
+      padding:2px 8px; border-radius:999px; font-weight:700;
+    }
   </style>
 </head>
 <body class="bg-gradient-to-br from-slate-900 to-blue-950 min-h-screen text-white">
@@ -286,6 +303,10 @@ app.get('/', (c) => {
     <button id="tabCamBtn" onclick="switchTab('camera')"
       class="tab-btn flex-1 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2">
       <i class="fas fa-camera"></i>カメラ録画
+    </button>
+    <button id="tabHistBtn" onclick="switchTab('history')"
+      class="tab-btn flex-1 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2">
+      <i class="fas fa-folder-open"></i>履歴・検索
     </button>
   </div>
 
@@ -368,6 +389,36 @@ app.get('/', (c) => {
       </div>
       <p class="text-xs text-slate-500 text-center">録画停止後、自動的に骨格解析して結果を表示します</p>
     </div>
+  </section>
+
+  <!-- ─── 履歴・検索タブ ─── -->
+  <section id="historySection" class="hidden mb-6">
+
+    <!-- 保存済みセッション一覧 -->
+    <div class="bg-slate-800/60 rounded-2xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-5">
+        <h2 class="text-xl font-bold">
+          <i class="fas fa-folder-open text-yellow-400 mr-2"></i>保存済みセッション
+        </h2>
+        <span id="sessionCount" class="text-xs text-slate-400">0 件</span>
+      </div>
+      <div id="sessionList" class="space-y-3">
+        <p class="text-slate-500 text-sm text-center py-6">
+          <i class="fas fa-inbox text-3xl mb-3 block text-slate-600"></i>
+          保存されたセッションはありません
+        </p>
+      </div>
+    </div>
+
+    <!-- 類似フォーム検索結果 -->
+    <div id="similarSection" class="hidden bg-slate-800/60 rounded-2xl p-6">
+      <h3 class="text-lg font-bold mb-4">
+        <i class="fas fa-search text-cyan-400 mr-2"></i>類似フォーム検索結果
+      </h3>
+      <p class="text-xs text-slate-400 mb-4" id="similarBaseInfo"></p>
+      <div id="similarList" class="space-y-3"></div>
+    </div>
+
   </section>
 
   <!-- 解析プログレス -->
@@ -541,6 +592,27 @@ app.get('/', (c) => {
       <pre id="detailedFeedback" class="whitespace-pre-wrap text-slate-300 text-sm leading-relaxed"></pre>
     </div>
 
+    <!-- 名前をつけて保存 -->
+    <div id="saveSessionCard" class="bg-gradient-to-br from-green-900/50 to-teal-900/50 border border-green-700/40 rounded-2xl p-6 mb-4">
+      <h4 class="font-bold mb-3 text-green-300">
+        <i class="fas fa-save mr-2"></i>この分析を保存する
+      </h4>
+      <p class="text-xs text-slate-400 mb-4">名前をつけてブラウザに保存。後から履歴・類似検索が使えます。</p>
+      <div class="flex gap-2">
+        <input id="sessionNameInput" type="text" placeholder="例: 朝練 5km、レース前チェック..."
+          class="flex-1 bg-slate-700/80 border border-slate-600 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-green-500 transition-colors"
+          maxlength="40">
+        <button id="saveSessionBtn" onclick="saveCurrentSession()"
+          class="bg-green-600 hover:bg-green-500 px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors whitespace-nowrap flex items-center gap-2">
+          <i class="fas fa-save"></i>保存
+        </button>
+      </div>
+      <div id="savedBadge" class="hidden mt-3 text-sm">
+        <span class="save-badge"><i class="fas fa-check"></i>保存済み</span>
+        <span id="savedName" class="text-slate-300 ml-2 text-xs"></span>
+      </div>
+    </div>
+
     <!-- ダウンロード（カメラ録画時のみ表示） -->
     <div id="downloadBtnWrap" class="hidden mb-3">
       <button onclick="downloadRecording()"
@@ -596,16 +668,313 @@ let recTimerInterval  = null   // タイマー更新用
 let currentDeviceId   = null   // 選択中カメラID
 
 // ==========================================
+// IndexedDB ユーティリティ
+// ==========================================
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('runlens', 1)
+    req.onupgradeneeded = e => {
+      const db = e.target.result
+      if (!db.objectStoreNames.contains('sessions')) {
+        const store = db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true })
+        store.createIndex('createdAt', 'createdAt')
+      }
+    }
+    req.onsuccess = e => resolve(e.target.result)
+    req.onerror   = e => reject(e.target.error)
+  })
+}
+
+async function dbGetAll() {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction('sessions', 'readonly')
+    const req = tx.objectStore('sessions').index('createdAt').getAll()
+    req.onsuccess = () => resolve(req.result.reverse())  // 新しい順
+    req.onerror   = () => reject(req.error)
+  })
+}
+
+async function dbAdd(session) {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction('sessions', 'readwrite')
+    const req = tx.objectStore('sessions').add(session)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror   = () => reject(req.error)
+  })
+}
+
+async function dbDelete(id) {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction('sessions', 'readwrite')
+    const req = tx.objectStore('sessions').delete(id)
+    req.onsuccess = () => resolve()
+    req.onerror   = () => reject(req.error)
+  })
+}
+
+// サムネイル生成（reviewVideoの現フレームをbase64に）
+function captureThumbnail() {
+  try {
+    const rv = document.getElementById('reviewVideo')
+    const c  = document.createElement('canvas')
+    c.width  = 160; c.height = 90
+    c.getContext('2d').drawImage(rv, 0, 0, 160, 90)
+    return c.toDataURL('image/jpeg', 0.7)
+  } catch(_) { return '' }
+}
+
+// 類似度計算用ベクトル生成（11次元）
+function makeVector(result, summary) {
+  return [
+    result.posture_score      / 100,
+    result.stride_score       / 100,
+    result.arm_swing_score    / 100,
+    result.foot_strike_score  / 100,
+    summary.avgAngles.leftKnee    / 180,
+    summary.avgAngles.rightKnee   / 180,
+    summary.avgAngles.leftElbow   / 180,
+    summary.avgAngles.rightElbow  / 180,
+    summary.avgAngles.trunkLean   / 45,
+    summary.symmetryScore,
+    Math.min(1, summary.trunkStability / 10),
+  ]
+}
+
+// コサイン類似度
+function cosineSim(a, b) {
+  const dot = a.reduce((s, v, i) => s + v * b[i], 0)
+  const ma  = Math.sqrt(a.reduce((s, v) => s + v * v, 0))
+  const mb  = Math.sqrt(b.reduce((s, v) => s + v * v, 0))
+  return (ma && mb) ? dot / (ma * mb) : 0
+}
+
+// ==========================================
+// 現在の分析をIndexedDBに保存
+// ==========================================
+let currentResult  = null
+let currentSummary = null
+let currentSavedId = null
+
+window.saveCurrentSession = async function() {
+  if (!currentResult || !currentSummary) {
+    alert('まず動画を解析してください')
+    return
+  }
+  const nameInput = document.getElementById('sessionNameInput')
+  const name = nameInput.value.trim() || '無題のセッション'
+
+  const btn = document.getElementById('saveSessionBtn')
+  btn.disabled = true
+  btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> 保存中...'
+
+  try {
+    const thumbnail = captureThumbnail()
+    const vector    = makeVector(currentResult, currentSummary)
+
+    // 動画Blobを保存（selectedFileがあれば）
+    let videoBlob = null
+    if (selectedFile) {
+      videoBlob = selectedFile instanceof File ? selectedFile : null
+    }
+
+    const session = {
+      name,
+      createdAt:  Date.now(),
+      result:     currentResult,
+      summary:    currentSummary,
+      vector,
+      thumbnail,
+      videoBlob,
+    }
+
+    currentSavedId = await dbAdd(session)
+
+    // 保存済みバッジ表示
+    document.getElementById('savedBadge').classList.remove('hidden')
+    document.getElementById('savedName').textContent = name
+    btn.innerHTML = '<i class="fas fa-check"></i> 保存済み'
+    btn.classList.replace('bg-green-600', 'bg-slate-600')
+    btn.disabled = true
+    nameInput.disabled = true
+
+  } catch(e) {
+    console.error('Save error:', e)
+    btn.disabled = false
+    btn.innerHTML = '<i class="fas fa-save"></i>保存'
+    alert('保存に失敗しました: ' + e.message)
+  }
+}
+
+// ==========================================
+// 履歴タブ：セッション一覧を描画
+// ==========================================
+async function renderSessionList() {
+  const list = document.getElementById('sessionList')
+  const countEl = document.getElementById('sessionCount')
+  list.innerHTML = '<p class="text-slate-400 text-sm text-center py-4"><i class="fas fa-circle-notch fa-spin mr-2"></i>読み込み中...</p>'
+
+  try {
+    const sessions = await dbGetAll()
+    countEl.textContent = sessions.length + ' 件'
+
+    if (sessions.length === 0) {
+      list.innerHTML = \`
+        <p class="text-slate-500 text-sm text-center py-6">
+          <i class="fas fa-inbox text-3xl mb-3 block text-slate-600"></i>
+          保存されたセッションはありません
+        </p>\`
+      return
+    }
+
+    list.innerHTML = sessions.map(s => {
+      const date = new Date(s.createdAt).toLocaleString('ja-JP', {
+        year:'numeric', month:'2-digit', day:'2-digit',
+        hour:'2-digit', minute:'2-digit'
+      })
+      const thumb = s.thumbnail
+        ? \`<img src="\${s.thumbnail}" class="w-20 h-12 object-cover rounded-lg flex-shrink-0 bg-slate-700">\`
+        : \`<div class="w-20 h-12 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
+             <i class="fas fa-running text-slate-500"></i></div>\`
+
+      return \`
+        <div class="session-card bg-slate-700/60 rounded-xl p-4 flex gap-3 items-start" data-id="\${s.id}">
+          \${thumb}
+          <div class="flex-1 min-w-0">
+            <div class="flex items-start justify-between gap-2">
+              <p class="font-semibold text-sm truncate">\${s.name}</p>
+              <div class="flex gap-1.5 flex-shrink-0">
+                <button onclick="findSimilar(\${s.id})"
+                  class="bg-cyan-700 hover:bg-cyan-600 text-xs px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap"
+                  title="この記録に似たフォームを検索">
+                  <i class="fas fa-search mr-1"></i>類似検索
+                </button>
+                <button onclick="deleteSession(\${s.id})"
+                  class="bg-red-900/60 hover:bg-red-800 text-xs px-2 py-1 rounded-lg transition-colors"
+                  title="削除">
+                  <i class="fas fa-trash"></i>
+                </button>
+              </div>
+            </div>
+            <p class="text-xs text-slate-400 mt-1">\${date}</p>
+            <div class="flex gap-3 mt-2 text-xs">
+              <span class="text-blue-300 font-bold">総合 \${s.result.overall_score}点</span>
+              <span class="text-slate-400">姿勢 \${s.result.posture_score}</span>
+              <span class="text-slate-400">ストライド \${s.result.stride_score}</span>
+              <span class="text-slate-400">腕 \${s.result.arm_swing_score}</span>
+              <span class="text-slate-400">着地 \${s.result.foot_strike_score}</span>
+            </div>
+          </div>
+        </div>\`
+    }).join('')
+
+  } catch(e) {
+    list.innerHTML = '<p class="text-red-400 text-sm text-center py-4">読み込みエラー: ' + e.message + '</p>'
+  }
+}
+
+// セッション削除
+window.deleteSession = async function(id) {
+  if (!confirm('このセッションを削除しますか？')) return
+  try {
+    await dbDelete(id)
+    await renderSessionList()
+    // 類似検索結果が表示中なら閉じる
+    document.getElementById('similarSection').classList.add('hidden')
+  } catch(e) {
+    alert('削除に失敗しました: ' + e.message)
+  }
+}
+
+// ==========================================
+// 類似フォーム検索
+// ==========================================
+window.findSimilar = async function(baseId) {
+  const sessions = await dbGetAll()
+  const base = sessions.find(s => s.id === baseId)
+  if (!base) return
+
+  // コサイン類似度でランキング
+  const ranked = sessions
+    .filter(s => s.id !== baseId && s.vector)
+    .map(s => ({
+      ...s,
+      similarity: cosineSim(base.vector, s.vector)
+    }))
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, 5)
+
+  const sec    = document.getElementById('similarSection')
+  const infoEl = document.getElementById('similarBaseInfo')
+  const listEl = document.getElementById('similarList')
+
+  sec.classList.remove('hidden')
+  infoEl.textContent = \`「\${base.name}」（総合 \${base.result.overall_score}点）に似たフォームを検索しました\`
+
+  if (ranked.length === 0) {
+    listEl.innerHTML = '<p class="text-slate-500 text-sm text-center py-4">比較できるセッションが他にありません</p>'
+    sec.scrollIntoView({ behavior: 'smooth' })
+    return
+  }
+
+  listEl.innerHTML = ranked.map((s, i) => {
+    const simPct = Math.round(s.similarity * 100)
+    const date = new Date(s.createdAt).toLocaleString('ja-JP', {
+      month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'
+    })
+    const medal = ['🥇','🥈','🥉','4.','5.'][i]
+    return \`
+      <div class="bg-slate-700/50 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">
+            <span class="text-lg">\${medal}</span>
+            <p class="font-semibold text-sm">\${s.name}</p>
+          </div>
+          <div class="text-right">
+            <p class="text-cyan-300 font-bold text-sm">\${simPct}% 一致</p>
+            <p class="text-slate-500 text-xs">\${date}</p>
+          </div>
+        </div>
+        <div class="mb-2">
+          <div class="h-1.5 bg-slate-600 rounded-full overflow-hidden">
+            <div class="sim-bar" style="width:\${simPct}%"></div>
+          </div>
+        </div>
+        <div class="flex gap-3 text-xs text-slate-400">
+          <span class="text-blue-300 font-bold">総合 \${s.result.overall_score}点</span>
+          <span>姿勢 \${s.result.posture_score}</span>
+          <span>ストライド \${s.result.stride_score}</span>
+          <span>腕 \${s.result.arm_swing_score}</span>
+          <span>着地 \${s.result.foot_strike_score}</span>
+        </div>
+      </div>\`
+  }).join('')
+
+  sec.scrollIntoView({ behavior: 'smooth' })
+}
+
+// ==========================================
 // タブ切替
 // ==========================================
 window.switchTab = function(tab) {
-  const isFile = tab === 'file'
+  const isFile    = tab === 'file'
+  const isCamera  = tab === 'camera'
+  const isHistory = tab === 'history'
+
   document.getElementById('tabFileBtn').classList.toggle('active', isFile)
-  document.getElementById('tabCamBtn').classList.toggle('active', !isFile)
+  document.getElementById('tabCamBtn').classList.toggle('active', isCamera)
+  document.getElementById('tabHistBtn').classList.toggle('active', isHistory)
+
   document.getElementById('uploadSection').classList.toggle('hidden', !isFile)
-  document.getElementById('cameraSection').classList.toggle('hidden', isFile)
-  if (!isFile) initCamera()
+  document.getElementById('cameraSection').classList.toggle('hidden', !isCamera)
+  document.getElementById('historySection').classList.toggle('hidden', !isHistory)
+
+  if (isCamera) initCamera()
   else stopCamera()
+
+  if (isHistory) renderSessionList()
 }
 
 // ==========================================
@@ -1221,6 +1590,21 @@ function showResult(data, summary) {
   hide('progressSection')
   show('resultSection')
 
+  // 現在の結果をグローバルに保存（IndexedDB保存・類似検索で使用）
+  currentResult  = data
+  currentSummary = summary
+  currentSavedId = null
+
+  // 保存UIをリセット
+  document.getElementById('savedBadge').classList.add('hidden')
+  document.getElementById('savedName').textContent = ''
+  document.getElementById('sessionNameInput').value = ''
+  document.getElementById('sessionNameInput').disabled = false
+  const saveBtn = document.getElementById('saveSessionBtn')
+  saveBtn.disabled = false
+  saveBtn.innerHTML = '<i class="fas fa-save"></i>保存'
+  saveBtn.classList.replace('bg-slate-600', 'bg-green-600')
+
   // カメラ録画由来なら「ダウンロード」ボタンを表示
   const isRecorded = selectedFile?.name?.startsWith('camera-rec-')
   document.getElementById('downloadBtnWrap').classList.toggle('hidden', !isRecorded)
@@ -1456,8 +1840,10 @@ window.resetApp = function() {
   stopCamera()
 
   poseFrames = []; selectedFile = null; analysisId = null; recordedChunks = []
+  currentResult = null; currentSummary = null; currentSavedId = null
+
   hide('progressSection'); hide('resultSection'); hide('errorBox')
-  hide('cameraSection')
+  hide('cameraSection'); hide('historySection')
   show('uploadSection')
   document.getElementById('fileInfo').classList.add('hidden')
   document.getElementById('videoInput').value = ''
@@ -1465,6 +1851,7 @@ window.resetApp = function() {
   // タブをファイルに戻す
   document.getElementById('tabFileBtn').classList.add('active')
   document.getElementById('tabCamBtn').classList.remove('active')
+  document.getElementById('tabHistBtn').classList.remove('active')
 }
 
 // 録画済み動画をダウンロード
