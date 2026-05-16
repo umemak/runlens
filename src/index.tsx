@@ -342,7 +342,7 @@ app.post('/api/analyze-ai', async (c) => {
 - 左膝角度（平均/最小/最大）: ${summary.avgAngles.leftKnee.toFixed(1)}° / ${summary.minAngles.leftKnee.toFixed(1)}° / ${summary.maxAngles.leftKnee.toFixed(1)}°
 - 右膝角度（平均/最小/最大）: ${summary.avgAngles.rightKnee.toFixed(1)}° / ${summary.minAngles.rightKnee.toFixed(1)}° / ${summary.maxAngles.rightKnee.toFixed(1)}°
 - 左肘角度（平均）: ${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: ${summary.avgAngles.rightElbow.toFixed(1)}°（理想: 85〜95°）
-- 左右対称スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（100%が完全対称）
+- 動作均等性スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（膝・肘の動き幅・平均の左右均一さ。100%が完全均等）
 - 体幹安定スコア: ${summary.trunkStability.toFixed(2)}（1.0が最高）
 - 着地パターン: ${footLabel}
 - 解析フレーム数: ${summary.frameCount}フレーム / ${summary.duration.toFixed(1)}秒
@@ -406,7 +406,7 @@ type PoseSummary = {
   avgAngles: FrameData['angles']
   minAngles: FrameData['angles']
   maxAngles: FrameData['angles']
-  symmetryScore: number       // 左右対称性 0-1
+  symmetryScore: number       // 動作均等性 0-1（膝・肘の動き幅・平均の均一さ）
   cadenceEstimate: number     // ストライド周期(fps換算)
   trunkStability: number      // 体幹安定度(分散の逆数)
   footStrikePattern: string   // 'forefoot' | 'midfoot' | 'heel'
@@ -448,7 +448,7 @@ MediaPipe Pose（WASM）でブラウザ側から抽出した骨格座標デー�
 - 平均左肘角度: ${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: ${summary.avgAngles.rightElbow.toFixed(1)}°
 - 平均股関節角度: 左 ${summary.avgAngles.leftHipAngle.toFixed(1)}°  右 ${summary.avgAngles.rightHipAngle.toFixed(1)}°
 - 膝角度の範囲: ${summary.minAngles.leftKnee.toFixed(1)}°〜${summary.maxAngles.leftKnee.toFixed(1)}°
-- 左右対称スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（100%が完全対称）
+- 動作均等性スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（膝・肘の動き幅・平均の左右均一さ。100%が完全均等）
 - 体幹安定スコア: ${summary.trunkStability.toFixed(2)}（値が大きいほど安定）
 - 着地パターン: ${summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット'}
 
@@ -2103,7 +2103,7 @@ function calcLocalScores(summary) {
                                   : 50 + Math.round(summary.trunkStability * 5)
   const postureScoreClamped = Math.min(100, Math.max(30, postureScore))
 
-  // --- ストライドスコア（膝角度の範囲と対称性）---
+  // --- ストライドスコア（膝角度の範囲と動作均等性）---
   const kneeRange   = summary.maxAngles.leftKnee - summary.minAngles.leftKnee
   const kneeRangeOk = kneeRange >= 20 && kneeRange <= 60
   const symPct      = summary.symmetryScore * 100
@@ -2131,7 +2131,7 @@ function calcLocalScores(summary) {
   // --- 良い点 ---
   const strengths = []
   if (trunkIdeal) strengths.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° は理想範囲（5〜10°）です\`)
-  if (symPct >= 90) strengths.push(\`左右対称性 \${symPct.toFixed(1)}% — バランスの良いフォームです\`)
+  if (symPct >= 90) strengths.push(\`動作均等性 \${symPct.toFixed(1)}% — 左右の膝・肘の動き幅がよく揃っています\`)
   if (elbowIdeal) strengths.push(\`肘角度 \${avgElbow.toFixed(1)}° — 腕振りが適切です\`)
   if (summary.footStrikePattern === 'midfoot') strengths.push('ミッドフット着地でひざへの衝撃が少ないフォームです')
   if (summary.footStrikePattern === 'forefoot') strengths.push('フォアフット着地でランニングエコノミーに優れています')
@@ -2144,7 +2144,7 @@ function calcLocalScores(summary) {
     improvements.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° — 理想は 5〜10°。\${trunkLean < 5 ? '少し前傾を意識すると推進力が上がります' : '前傾しすぎると腰への負担が増えます。上体を少し起こしましょう'}\`)
   }
   if (symPct < 85) {
-    improvements.push(\`左右対称性 \${symPct.toFixed(1)}% — 90%以上が理想。左右のフォームのばらつきを減らしましょう\`)
+    improvements.push(\`動作均等性 \${symPct.toFixed(1)}% — 90%以上が理想。左右の膝・肘の動き幅を揃えることを意識しましょう\`)
   }
   if (!elbowOk) {
     improvements.push(\`肘角度 \${avgElbow.toFixed(1)}° — 理想は 85〜95°。肘を直角に近づけると腕振りが効率的になります\`)
@@ -2169,7 +2169,7 @@ function calcLocalScores(summary) {
     '【ストライド・膝】',
     \`左膝平均: \${summary.avgAngles.leftKnee.toFixed(1)}°  右膝平均: \${summary.avgAngles.rightKnee.toFixed(1)}°\`,
     \`膝角度範囲: \${summary.minAngles.leftKnee.toFixed(1)}°〜\${summary.maxAngles.leftKnee.toFixed(1)}°\`,
-    \`左右対称性: \${symPct.toFixed(1)}%\`,
+    \`動作均等性: \${symPct.toFixed(1)}%（膝・肘の動き幅の均一さ）\`,
     '',
     '【腕振り】',
     \`左肘: \${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: \${summary.avgAngles.rightElbow.toFixed(1)}°（理想: 85〜95°）\`,
@@ -2239,7 +2239,7 @@ function showResult(data, summary) {
     ['体幹前傾角', summary.avgAngles.trunkLean.toFixed(1) + '°（理想: 5〜10°）'],
     ['左膝平均角', summary.avgAngles.leftKnee.toFixed(1) + '°'],
     ['右膝平均角', summary.avgAngles.rightKnee.toFixed(1) + '°'],
-    ['左右対称性', (summary.symmetryScore * 100).toFixed(1) + '%'],
+    ['動作均等性', (summary.symmetryScore * 100).toFixed(1) + '%'],
     ['体幹安定度', summary.trunkStability.toFixed(2)],
     ['着地パターン', summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット'],
     ['解析フレーム数', summary.frameCount + ' フレーム'],
