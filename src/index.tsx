@@ -1754,11 +1754,49 @@ function extractAngles(lm) {
 
 function detectFootStrike(frames) {
   if (frames.length === 0) return 'unknown'
-  const avgKnee = frames.reduce((s, f) =>
-    s + (f.angles.leftKnee + f.angles.rightKnee) / 2, 0) / frames.length
-  if (avgKnee > 165) return 'heel'
-  if (avgKnee > 150) return 'midfoot'
-  return 'forefoot'
+
+  // 踵(29/30) と つま先(31/32) のY座標差で着地パターンを判定
+  // MediaPipe正規化座標: Y軸は下向き（大きい = 画面下）
+  // 着地瞬間に近いフレーム（膝角度が小さい = 屈曲が大きい）を優先
+  // 側面撮影が前提。正面撮影では信頼性が下がる。
+  let heelCount = 0, midfootCount = 0, forefootCount = 0
+
+  for (const f of frames) {
+    const lm = f.landmarks
+    if (!lm || lm.length < 33) continue
+
+    // 左足
+    const leftHeel  = lm[29], leftToe  = lm[31]
+    // 右足
+    const rightHeel = lm[30], rightToe = lm[32]
+
+    // 可視性が低い場合はスキップ
+    const leftVis  = Math.min(leftHeel?.visibility  ?? 0, leftToe?.visibility  ?? 0)
+    const rightVis = Math.min(rightHeel?.visibility ?? 0, rightToe?.visibility ?? 0)
+
+    // 左右どちらか可視性が高い方を使う
+    let heelY, toeY
+    if (leftVis >= rightVis && leftVis > 0.3) {
+      heelY = leftHeel.y; toeY = leftToe.y
+    } else if (rightVis > 0.3) {
+      heelY = rightHeel.y; toeY = rightToe.y
+    } else {
+      continue
+    }
+
+    // Y差（正規化座標）: 踵がつま先より下（大）= ヒール着地
+    const diff = heelY - toeY
+    if      (diff >  0.03) heelCount++       // 踵が明らかに下
+    else if (diff < -0.03) forefootCount++   // つま先が明らかに下
+    else                   midfootCount++    // ほぼ同じ高さ
+  }
+
+  const total = heelCount + midfootCount + forefootCount
+  if (total === 0) return 'unknown'
+
+  if      (heelCount     / total > 0.5) return 'heel'
+  else if (forefootCount / total > 0.4) return 'forefoot'
+  else                                  return 'midfoot'
 }
 
 function avgAngles(frames) {
@@ -1784,20 +1822,30 @@ function minMaxAngles(frames) {
 
 function symmetryScore(frames) {
   if (frames.length === 0) return 0
-  const diffs = frames.map(f =>
-    Math.abs(f.angles.leftKnee  - f.angles.rightKnee) +
-    Math.abs(f.angles.leftElbow - f.angles.rightElbow)
-  )
-  const avgDiff = diffs.reduce((s, d) => s + d, 0) / diffs.length
-  return Math.max(0, 1 - avgDiff / 90)
+
+  // 膝と肘をそれぞれ独立して正規化し、平均をとる
+  // 閾値: 40°差 → スコア0（ランニングで左右40°のずれは明らかな非対称）
+  const kneeDiffs  = frames.map(f => Math.abs(f.angles.leftKnee  - f.angles.rightKnee))
+  const elbowDiffs = frames.map(f => Math.abs(f.angles.leftElbow - f.angles.rightElbow))
+
+  const avgKneeDiff  = kneeDiffs.reduce((s, d)  => s + d, 0) / frames.length
+  const avgElbowDiff = elbowDiffs.reduce((s, d) => s + d, 0) / frames.length
+
+  const kneeScore  = Math.max(0, 1 - avgKneeDiff  / 40)  // 40°差でスコア0
+  const elbowScore = Math.max(0, 1 - avgElbowDiff / 40)  // 40°差でスコア0
+
+  return (kneeScore + elbowScore) / 2
 }
 
 function trunkStability(frames) {
   if (frames.length < 2) return 1
-  const leans = frames.map(f => f.angles.trunkLean)
-  const mean  = leans.reduce((s, v) => s + v, 0) / leans.length
+  const leans    = frames.map(f => f.angles.trunkLean)
+  const mean     = leans.reduce((s, v) => s + v, 0) / leans.length
   const variance = leans.reduce((s, v) => s + (v - mean) ** 2, 0) / leans.length
-  return variance < 1 ? 10 : 1 / Math.sqrt(variance)
+  // variance < 1 のときは安定度が非常に高い（≒1.0）
+  // variance が大きいほど前傾角がぶれている → スコアが下がる
+  // Math.min(1.0, ...) で上限を1.0に固定
+  return variance < 1 ? 1.0 : Math.min(1.0, 1 / Math.sqrt(variance))
 }
 
 // ==========================================
