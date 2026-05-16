@@ -12,5 +12,11 @@
       "database_name": "runlens-db",
       "database_id": "18a0e95a-a1f9-4c10-b875-38bdc45f738e"
     }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "runlens-videos"
+    }
   ]
 }
