@@ -178,54 +178,143 @@ app.get('/api/auth/me', async (c) => {
 })
 
 // ==========================================
-// 座標ベース分析API（WASMから呼ぶ）
+// セッション保存API（分析結果をD1に保存）
 // ==========================================
-app.post('/api/analyze-pose', async (c) => {
+
+// 動画をR2にアップロード → video_keyを返す
+app.post('/api/sessions/upload-video', requireAuth, async (c) => {
   try {
-    const body = await c.req.json() as {
-      summary: PoseSummary
-      sampleFrames: FrameData[]
-    }
+    const userId = c.get('userId') as number
+    const formData = await c.req.formData()
+    const file = formData.get('video') as File | null
+    if (!file) return c.json({ error: '動画ファイルがありません' }, 400)
 
-    if (!body.summary || !body.sampleFrames) {
-      return c.json({ error: 'Invalid pose data' }, 400)
-    }
-
-    // DBに分析レコードを作成
-    const result = await c.env.DB.prepare(`
-      INSERT INTO analyses (video_key, status) VALUES (?, 'processing')
-    `).bind(`pose-${Date.now()}`).run()
-    const analysisId = result.meta.last_row_id as number
-
-    // 非同期でGPT-5分析
-    c.executionCtx.waitUntil(
-      analyzeWithGPT(c.env, analysisId, body.summary, body.sampleFrames)
-    )
-
-    return c.json({ success: true, analysisId })
-  } catch (error) {
-    console.error('analyze-pose error:', error)
-    return c.json({ error: 'Failed to start analysis' }, 500)
+    const ext      = file.name.split('.').pop() || 'webm'
+    const videoKey = `users/${userId}/${Date.now()}.${ext}`
+    await c.env.R2.put(videoKey, await file.arrayBuffer(), {
+      httpMetadata: { contentType: file.type || 'video/webm' }
+    })
+    return c.json({ success: true, videoKey })
+  } catch (e) {
+    console.error('upload-video error:', e)
+    return c.json({ error: '動画のアップロードに失敗しました' }, 500)
   }
 })
 
-// 分析結果取得
-app.get('/api/analysis/:id', async (c) => {
+// 分析結果をD1に保存
+app.post('/api/sessions', requireAuth, async (c) => {
   try {
-    const id = c.req.param('id')
-    const result = await c.env.DB.prepare(
-      'SELECT * FROM analyses WHERE id = ?'
-    ).bind(id).first()
+    const userId = c.get('userId') as number
+    const body = await c.req.json() as {
+      name: string
+      videoKey: string
+      result: any
+      summary: any
+      vector: number[]
+    }
+    if (!body.result || !body.summary) return c.json({ error: 'Invalid data' }, 400)
 
-    if (!result) return c.json({ error: 'Not found' }, 404)
+    const name    = (body.name || '無題のセッション').slice(0, 40)
+    const videoKey = body.videoKey || `pose-${Date.now()}`
 
-    return c.json({
-      ...result,
-      strengths:    result.strengths    ? JSON.parse(result.strengths as string)    : [],
-      improvements: result.improvements ? JSON.parse(result.improvements as string) : [],
+    const res = await c.env.DB.prepare(`
+      INSERT INTO analyses
+        (user_id, name, video_key, status,
+         overall_score, posture_score, stride_score, arm_swing_score, foot_strike_score,
+         strengths, improvements, detailed_feedback, summary, vector, updated_at)
+      VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(
+      userId, name, videoKey,
+      body.result.overall_score,
+      body.result.posture_score,
+      body.result.stride_score,
+      body.result.arm_swing_score,
+      body.result.foot_strike_score,
+      JSON.stringify(body.result.strengths),
+      JSON.stringify(body.result.improvements),
+      body.result.detailed_feedback,
+      JSON.stringify(body.summary),
+      JSON.stringify(body.vector || []),
+    ).run()
+
+    return c.json({ success: true, id: res.meta.last_row_id })
+  } catch (e) {
+    console.error('save session error:', e)
+    return c.json({ error: '保存に失敗しました' }, 500)
+  }
+})
+
+// セッション一覧取得（ログインユーザーのみ）
+app.get('/api/sessions', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number
+    const rows = await c.env.DB.prepare(`
+      SELECT id, name, video_key, overall_score, posture_score, stride_score,
+             arm_swing_score, foot_strike_score, summary, vector, created_at
+      FROM analyses
+      WHERE user_id = ? AND status = 'completed'
+      ORDER BY created_at DESC
+    `).bind(userId).all()
+
+    const sessions = rows.results.map((r: any) => ({
+      ...r,
+      summary: r.summary ? JSON.parse(r.summary) : null,
+      vector:  r.vector  ? JSON.parse(r.vector)  : [],
+    }))
+    return c.json({ sessions })
+  } catch (e) {
+    return c.json({ error: 'Failed to fetch sessions' }, 500)
+  }
+})
+
+// セッション削除
+app.delete('/api/sessions/:id', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId') as number
+    const sessionId = c.req.param('id')
+
+    // 所有確認してからR2の動画も削除
+    const row = await c.env.DB.prepare(
+      'SELECT video_key FROM analyses WHERE id = ? AND user_id = ?'
+    ).bind(sessionId, userId).first()
+    if (!row) return c.json({ error: 'Not found' }, 404)
+
+    // R2から動画削除（存在すれば）
+    if (row.video_key && (row.video_key as string).startsWith('users/')) {
+      await c.env.R2.delete(row.video_key as string)
+    }
+
+    await c.env.DB.prepare('DELETE FROM analyses WHERE id = ? AND user_id = ?')
+      .bind(sessionId, userId).run()
+
+    return c.json({ success: true })
+  } catch (e) {
+    return c.json({ error: 'Failed to delete session' }, 500)
+  }
+})
+
+// 動画をR2から取得（署名付きURLの代わりにプロキシ）
+app.get('/api/sessions/:id/video', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId') as number
+    const sessionId = c.req.param('id')
+
+    const row = await c.env.DB.prepare(
+      'SELECT video_key FROM analyses WHERE id = ? AND user_id = ?'
+    ).bind(sessionId, userId).first()
+    if (!row || !row.video_key) return c.json({ error: 'Not found' }, 404)
+
+    const obj = await c.env.R2.get(row.video_key as string)
+    if (!obj) return c.json({ error: 'Video not found in storage' }, 404)
+
+    return new Response(obj.body, {
+      headers: {
+        'Content-Type': obj.httpMetadata?.contentType || 'video/webm',
+        'Cache-Control': 'private, max-age=3600',
+      }
     })
-  } catch (error) {
-    return c.json({ error: 'Failed to get analysis' }, 500)
+  } catch (e) {
+    return c.json({ error: 'Failed to get video' }, 500)
   }
 })
 
@@ -1008,52 +1097,8 @@ let recTimerInterval  = null   // タイマー更新用
 let currentDeviceId   = null   // 選択中カメラID
 
 // ==========================================
-// IndexedDB ユーティリティ
+// サーバーAPI ユーティリティ
 // ==========================================
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('runlens', 1)
-    req.onupgradeneeded = e => {
-      const db = e.target.result
-      if (!db.objectStoreNames.contains('sessions')) {
-        const store = db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true })
-        store.createIndex('createdAt', 'createdAt')
-      }
-    }
-    req.onsuccess = e => resolve(e.target.result)
-    req.onerror   = e => reject(e.target.error)
-  })
-}
-
-async function dbGetAll() {
-  const db = await openDB()
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction('sessions', 'readonly')
-    const req = tx.objectStore('sessions').index('createdAt').getAll()
-    req.onsuccess = () => resolve(req.result.reverse())  // 新しい順
-    req.onerror   = () => reject(req.error)
-  })
-}
-
-async function dbAdd(session) {
-  const db = await openDB()
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction('sessions', 'readwrite')
-    const req = tx.objectStore('sessions').add(session)
-    req.onsuccess = () => resolve(req.result)
-    req.onerror   = () => reject(req.error)
-  })
-}
-
-async function dbDelete(id) {
-  const db = await openDB()
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction('sessions', 'readwrite')
-    const req = tx.objectStore('sessions').delete(id)
-    req.onsuccess = () => resolve()
-    req.onerror   = () => reject(req.error)
-  })
-}
 
 // サムネイル生成（reviewVideoの現フレームをbase64に）
 function captureThumbnail() {
@@ -1092,7 +1137,7 @@ function cosineSim(a, b) {
 }
 
 // ==========================================
-// 現在の分析をIndexedDBに保存
+// 現在の分析をD1/R2に保存
 // ==========================================
 let currentResult  = null
 let currentSummary = null
@@ -1111,26 +1156,35 @@ window.saveCurrentSession = async function() {
   btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> 保存中...'
 
   try {
-    const thumbnail = captureThumbnail()
-    const vector    = makeVector(currentResult, currentSummary)
-
-    // 動画Blobを保存（selectedFileがあれば）
-    let videoBlob = null
+    // 1. 動画をR2にアップロード
+    let videoKey = ''
     if (selectedFile) {
-      videoBlob = selectedFile instanceof File ? selectedFile : null
+      btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> 動画をアップロード中...'
+      const fd = new FormData()
+      fd.append('video', selectedFile)
+      const upRes = await fetch('/api/sessions/upload-video', {
+        method: 'POST', credentials: 'include', body: fd
+      })
+      if (upRes.ok) {
+        const upData = await upRes.json()
+        videoKey = upData.videoKey || ''
+      }
     }
 
-    const session = {
-      name,
-      createdAt:  Date.now(),
-      result:     currentResult,
-      summary:    currentSummary,
-      vector,
-      thumbnail,
-      videoBlob,
+    // 2. 分析結果をD1に保存
+    btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> 結果を保存中...'
+    const vector = makeVector(currentResult, currentSummary)
+    const res = await fetch('/api/sessions', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, videoKey, result: currentResult, summary: currentSummary, vector })
+    })
+    if (!res.ok) {
+      const err = await res.json()
+      throw new Error(err.error || '保存失敗')
     }
-
-    currentSavedId = await dbAdd(session)
+    const data = await res.json()
+    currentSavedId = data.id
 
     // 保存済みバッジ表示
     document.getElementById('savedBadge').classList.remove('hidden')
@@ -1149,18 +1203,23 @@ window.saveCurrentSession = async function() {
 }
 
 // ==========================================
-// 履歴タブ：セッション一覧を描画
+// 履歴タブ：セッション一覧を描画（APIから取得）
 // ==========================================
+let _cachedSessions = []
+
 async function renderSessionList() {
-  const list = document.getElementById('sessionList')
+  const list    = document.getElementById('sessionList')
   const countEl = document.getElementById('sessionCount')
   list.innerHTML = '<p class="text-slate-400 text-sm text-center py-4"><i class="fas fa-circle-notch fa-spin mr-2"></i>読み込み中...</p>'
 
   try {
-    const sessions = await dbGetAll()
-    countEl.textContent = sessions.length + ' 件'
+    const res = await fetch('/api/sessions', { credentials: 'include' })
+    if (!res.ok) throw new Error('取得失敗')
+    const { sessions } = await res.json()
+    _cachedSessions = sessions || []
+    countEl.textContent = _cachedSessions.length + ' 件'
 
-    if (sessions.length === 0) {
+    if (_cachedSessions.length === 0) {
       list.innerHTML = \`
         <p class="text-slate-500 text-sm text-center py-6">
           <i class="fas fa-inbox text-3xl mb-3 block text-slate-600"></i>
@@ -1169,13 +1228,16 @@ async function renderSessionList() {
       return
     }
 
-    list.innerHTML = sessions.map(s => {
-      const date = new Date(s.createdAt).toLocaleString('ja-JP', {
+    list.innerHTML = _cachedSessions.map(s => {
+      const date = new Date(s.created_at).toLocaleString('ja-JP', {
         year:'numeric', month:'2-digit', day:'2-digit',
         hour:'2-digit', minute:'2-digit'
       })
-      const thumb = s.thumbnail
-        ? \`<img src="\${s.thumbnail}" class="w-20 h-12 object-cover rounded-lg flex-shrink-0 bg-slate-700">\`
+      const hasVideo = s.video_key && s.video_key.startsWith('users/')
+      const thumb = hasVideo
+        ? \`<div class="w-20 h-12 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0 relative overflow-hidden">
+             <i class="fas fa-film text-slate-400 text-lg"></i>
+           </div>\`
         : \`<div class="w-20 h-12 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
              <i class="fas fa-running text-slate-500"></i></div>\`
 
@@ -1186,6 +1248,9 @@ async function renderSessionList() {
             <div class="flex items-start justify-between gap-2">
               <p class="font-semibold text-sm truncate">\${s.name}</p>
               <div class="flex gap-1.5 flex-shrink-0">
+                \${hasVideo ? \`<button onclick="playSessionVideo(\${s.id})"
+                  class="bg-slate-600 hover:bg-slate-500 text-xs px-2.5 py-1 rounded-lg transition-colors"
+                  title="動画を再生"><i class="fas fa-play mr-1"></i>再生</button>\` : ''}
                 <button onclick="findSimilar(\${s.id})"
                   class="bg-cyan-700 hover:bg-cyan-600 text-xs px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap"
                   title="この記録に似たフォームを検索">
@@ -1200,11 +1265,11 @@ async function renderSessionList() {
             </div>
             <p class="text-xs text-slate-400 mt-1">\${date}</p>
             <div class="flex gap-3 mt-2 text-xs">
-              <span class="text-blue-300 font-bold">総合 \${s.result.overall_score}点</span>
-              <span class="text-slate-400">姿勢 \${s.result.posture_score}</span>
-              <span class="text-slate-400">ストライド \${s.result.stride_score}</span>
-              <span class="text-slate-400">腕 \${s.result.arm_swing_score}</span>
-              <span class="text-slate-400">着地 \${s.result.foot_strike_score}</span>
+              <span class="text-blue-300 font-bold">総合 \${s.overall_score}点</span>
+              <span class="text-slate-400">姿勢 \${s.posture_score}</span>
+              <span class="text-slate-400">ストライド \${s.stride_score}</span>
+              <span class="text-slate-400">腕 \${s.arm_swing_score}</span>
+              <span class="text-slate-400">着地 \${s.foot_strike_score}</span>
             </div>
           </div>
         </div>\`
@@ -1215,13 +1280,28 @@ async function renderSessionList() {
   }
 }
 
+// 履歴から動画を再生
+window.playSessionVideo = function(id) {
+  const url = \`/api/sessions/\${id}/video\`
+  const rv  = document.getElementById('reviewVideo')
+  if (!rv) return
+  // 結果セクションを表示して動画をセット
+  show('resultSection')
+  hide('historySection')
+  rv.src = url
+  rv.load()
+  rv.play()
+  document.getElementById('tabFileBtn').classList.remove('active')
+  document.getElementById('tabHistBtn').classList.remove('active')
+}
+
 // セッション削除
 window.deleteSession = async function(id) {
-  if (!confirm('このセッションを削除しますか？')) return
+  if (!confirm('このセッションを削除しますか？動画も削除されます。')) return
   try {
-    await dbDelete(id)
+    const res = await fetch(\`/api/sessions/\${id}\`, { method: 'DELETE', credentials: 'include' })
+    if (!res.ok) throw new Error('削除失敗')
     await renderSessionList()
-    // 類似検索結果が表示中なら閉じる
     document.getElementById('similarSection').classList.add('hidden')
   } catch(e) {
     alert('削除に失敗しました: ' + e.message)
@@ -1229,20 +1309,20 @@ window.deleteSession = async function(id) {
 }
 
 // ==========================================
-// 類似フォーム検索
+// 類似フォーム検索（キャッシュから計算）
 // ==========================================
 window.findSimilar = async function(baseId) {
-  const sessions = await dbGetAll()
-  const base = sessions.find(s => s.id === baseId)
-  if (!base) return
+  // キャッシュが空なら再取得
+  if (_cachedSessions.length === 0) await renderSessionList()
+  const base = _cachedSessions.find(s => s.id === baseId)
+  if (!base || !base.vector || base.vector.length === 0) {
+    alert('このセッションには類似検索用データがありません')
+    return
+  }
 
-  // コサイン類似度でランキング
-  const ranked = sessions
-    .filter(s => s.id !== baseId && s.vector)
-    .map(s => ({
-      ...s,
-      similarity: cosineSim(base.vector, s.vector)
-    }))
+  const ranked = _cachedSessions
+    .filter(s => s.id !== baseId && s.vector && s.vector.length > 0)
+    .map(s => ({ ...s, similarity: cosineSim(base.vector, s.vector) }))
     .sort((a, b) => b.similarity - a.similarity)
     .slice(0, 5)
 
@@ -1251,7 +1331,7 @@ window.findSimilar = async function(baseId) {
   const listEl = document.getElementById('similarList')
 
   sec.classList.remove('hidden')
-  infoEl.textContent = \`「\${base.name}」（総合 \${base.result.overall_score}点）に似たフォームを検索しました\`
+  infoEl.textContent = \`「\${base.name}」（総合 \${base.overall_score}点）に似たフォームを検索しました\`
 
   if (ranked.length === 0) {
     listEl.innerHTML = '<p class="text-slate-500 text-sm text-center py-4">比較できるセッションが他にありません</p>'
@@ -1261,7 +1341,7 @@ window.findSimilar = async function(baseId) {
 
   listEl.innerHTML = ranked.map((s, i) => {
     const simPct = Math.round(s.similarity * 100)
-    const date = new Date(s.createdAt).toLocaleString('ja-JP', {
+    const date = new Date(s.created_at).toLocaleString('ja-JP', {
       month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'
     })
     const medal = ['🥇','🥈','🥉','4.','5.'][i]
@@ -1283,11 +1363,11 @@ window.findSimilar = async function(baseId) {
           </div>
         </div>
         <div class="flex gap-3 text-xs text-slate-400">
-          <span class="text-blue-300 font-bold">総合 \${s.result.overall_score}点</span>
-          <span>姿勢 \${s.result.posture_score}</span>
-          <span>ストライド \${s.result.stride_score}</span>
-          <span>腕 \${s.result.arm_swing_score}</span>
-          <span>着地 \${s.result.foot_strike_score}</span>
+          <span class="text-blue-300 font-bold">総合 \${s.overall_score}点</span>
+          <span>姿勢 \${s.posture_score}</span>
+          <span>ストライド \${s.stride_score}</span>
+          <span>腕 \${s.arm_swing_score}</span>
+          <span>着地 \${s.foot_strike_score}</span>
         </div>
       </div>\`
   }).join('')
