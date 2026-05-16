@@ -9,8 +9,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "webapp-production",
-      "database_id": "0a6f9f29-3bfe-40a2-824c-f17990c47409"
+      "database_name": "runlens-db",
+      "database_id": "18a0e95a-a1f9-4c10-b875-38bdc45f738e"
     }
   ]
 }
