@@ -346,7 +346,7 @@ type PoseSummary = {
 }
 
 // ==========================================
-// GPT-5分析
+// GPT分析（現在未使用 / OPENAI_API_KEY未設定時は呼ばれない）
 // ==========================================
 async function analyzeWithGPT(
   env: Bindings,
@@ -465,7 +465,7 @@ app.get('/', (c) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RunLens - AIランニングフォーム分析</title>
+  <title>RunLens - ランニングフォーム分析</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
@@ -866,7 +866,7 @@ app.get('/', (c) => {
         </div>
       </div>
       <h3 class="text-xl font-bold">総合スコア</h3>
-      <p class="text-sm text-slate-400 mt-1">GPT-5 × MediaPipe骨格データによる分析</p>
+      <p class="text-sm text-slate-400 mt-1">MediaPipe骨格データによるルールベース分析</p>
     </div>
 
     <!-- 4項目スコア -->
@@ -913,7 +913,7 @@ app.get('/', (c) => {
 
     <!-- 詳細フィードバック -->
     <div class="bg-gradient-to-br from-blue-900/50 to-purple-900/50 rounded-2xl p-6 mb-6">
-      <h4 class="font-bold mb-4 text-blue-300"><i class="fas fa-comment-alt mr-2"></i>AI詳細フィードバック</h4>
+      <h4 class="font-bold mb-4 text-blue-300"><i class="fas fa-comment-alt mr-2"></i>詳細フィードバック</h4>
       <pre id="detailedFeedback" class="whitespace-pre-wrap text-slate-300 text-sm leading-relaxed"></pre>
     </div>
 
