@@ -1717,12 +1717,36 @@ function angle3(a, b, c) {
 function extractAngles(lm) {
   // 33点ランドマーク配列からインデックスで取得
   const L = i => lm[i]
+
+  // 体幹前傾角: 左右股関節中点 → 左右肩中点 のベクトルと
+  // 垂直軸（真上 = y が減少する方向）のなす角度
+  // MediaPipe正規化座標はY軸下向きなので、垂直上向き = (0, -1)
+  function trunkLeanAngle() {
+    const hipMid = {
+      x: (L(23).x + L(24).x) / 2,
+      y: (L(23).y + L(24).y) / 2,
+    }
+    const shoulderMid = {
+      x: (L(11).x + L(12).x) / 2,
+      y: (L(11).y + L(12).y) / 2,
+    }
+    // 股関節中点 → 肩中点 のベクトル
+    const vx = shoulderMid.x - hipMid.x
+    const vy = shoulderMid.y - hipMid.y  // 上向きなので通常マイナス
+    // 垂直上向きベクトル (0, -1) との角度
+    const mag = Math.sqrt(vx * vx + vy * vy)
+    if (mag === 0) return 0
+    // dot product with (0, -1) = -vy
+    const cosA = Math.max(-1, Math.min(1, -vy / mag))
+    return (Math.acos(cosA) * 180) / Math.PI
+  }
+
   return {
     leftKnee:      angle3(L(23), L(25), L(27)),
     rightKnee:     angle3(L(24), L(26), L(28)),
     leftElbow:     angle3(L(11), L(13), L(15)),
     rightElbow:    angle3(L(12), L(14), L(16)),
-    trunkLean:     angle3(L(23), L(11), { x: L(11).x, y: 0 }),  // 肩から垂直への角度
+    trunkLean:     trunkLeanAngle(),   // 股関節中点→肩中点と垂直軸のなす角
     leftHipAngle:  angle3(L(11), L(23), L(25)),
     rightHipAngle: angle3(L(12), L(24), L(26)),
   }
@@ -1898,9 +1922,11 @@ window.startAnalysis = async function() {
 // ==========================================
 function calcLocalScores(summary) {
   // --- 姿勢スコア（体幹前傾角と安定度）---
-  const trunkLean = summary.avgAngles.trunkLean
-  const trunkIdeal = trunkLean >= 5 && trunkLean <= 10
-  const trunkOk    = trunkLean >= 3 && trunkLean <= 15
+  // trunkLean = 垂直軸からのずれ角（0° = 直立、正の値 = 前傾）
+  // ランニングの理想は5〜10°前傾
+  const trunkLean  = summary.avgAngles.trunkLean
+  const trunkIdeal = trunkLean >= 5  && trunkLean <= 10
+  const trunkOk    = trunkLean >= 3  && trunkLean <= 20
   const postureScore = trunkIdeal ? 90 + Math.round(summary.trunkStability * 5)
                      : trunkOk    ? 70 + Math.round(summary.trunkStability * 5)
                                   : 50 + Math.round(summary.trunkStability * 5)
@@ -1944,7 +1970,7 @@ function calcLocalScores(summary) {
   // --- 改善点 ---
   const improvements = []
   if (!trunkOk) {
-    improvements.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° — 理想は 5〜10°。\${trunkLean < 5 ? '少し前傾を増やすと推進力が上がります' : '前傾しすぎると腰への負担が増えます'}\`)
+    improvements.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° — 理想は 5〜10°。\${trunkLean < 5 ? '少し前傾を意識すると推進力が上がります' : '前傾しすぎると腰への負担が増えます。上体を少し起こしましょう'}\`)
   }
   if (symPct < 85) {
     improvements.push(\`左右対称性 \${symPct.toFixed(1)}% — 90%以上が理想。左右のフォームのばらつきを減らしましょう\`)
