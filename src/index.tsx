@@ -1915,20 +1915,41 @@ function minMaxAngles(frames) {
 }
 
 function symmetryScore(frames) {
-  if (frames.length === 0) return 0
+  if (frames.length < 2) return 0
 
-  // 膝と肘をそれぞれ独立して正規化し、平均をとる
-  // 閾値: 40°差 → スコア0（ランニングで左右40°のずれは明らかな非対称）
-  const kneeDiffs  = frames.map(f => Math.abs(f.angles.leftKnee  - f.angles.rightKnee))
-  const elbowDiffs = frames.map(f => Math.abs(f.angles.leftElbow - f.angles.rightElbow))
+  // ── ヘルパー ──────────────────────────────────────────────────
+  const avg = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length
+  const std = (arr) => {
+    const m = avg(arr)
+    return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length)
+  }
 
-  const avgKneeDiff  = kneeDiffs.reduce((s, d)  => s + d, 0) / frames.length
-  const avgElbowDiff = elbowDiffs.reduce((s, d) => s + d, 0) / frames.length
+  // ── 各関節の時系列を抽出 ──────────────────────────────────────
+  const lKnee  = frames.map(f => f.angles.leftKnee)
+  const rKnee  = frames.map(f => f.angles.rightKnee)
+  const lElbow = frames.map(f => f.angles.leftElbow)
+  const rElbow = frames.map(f => f.angles.rightElbow)
 
-  const kneeScore  = Math.max(0, 1 - avgKneeDiff  / 40)  // 40°差でスコア0
-  const elbowScore = Math.max(0, 1 - avgElbowDiff / 40)  // 40°差でスコア0
+  // ── 統計量（平均・標準偏差）を左右で比較 ─────────────────────
+  // ランニングは左右が逆位相で動くため、同フレームの差ではなく
+  // 「動きの統計量の差」で非対称性を評価する
+  //
+  // 膝: 平均差（閾値15°）+ 標準偏差差（閾値10°）
+  const kneeMeanDiff = Math.abs(avg(lKnee)  - avg(rKnee))
+  const kneeStdDiff  = Math.abs(std(lKnee)  - std(rKnee))
+  const kneeAsym     = kneeMeanDiff / 15 + kneeStdDiff / 10
 
-  return (kneeScore + elbowScore) / 2
+  // 肘: 平均差（閾値15°）+ 標準偏差差（閾値10°）
+  const elbowMeanDiff = Math.abs(avg(lElbow) - avg(rElbow))
+  const elbowStdDiff  = Math.abs(std(lElbow) - std(rElbow))
+  const elbowAsym     = elbowMeanDiff / 15 + elbowStdDiff / 10
+
+  // kneeAsym / elbowAsym = 0 → 完全対称、≥1 → 明らかな非対称
+  const kneeScore  = Math.max(0, 1 - kneeAsym)
+  const elbowScore = Math.max(0, 1 - elbowAsym)
+
+  // 膝を重視（ストライドの左右差は走行効率に直結）
+  return kneeScore * 0.7 + elbowScore * 0.3
 }
 
 function trunkStability(frames) {
