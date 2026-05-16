@@ -1,10 +1,59 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 
 type Bindings = {
-  DB?: D1Database
+  DB: D1Database
+  R2: R2Bucket
   OPENAI_API_KEY?: string
   OPENAI_BASE_URL?: string
+}
+
+// ==========================================
+// パスワードユーティリティ（Web Crypto API）
+// ==========================================
+async function hashPassword(password: string, salt: string): Promise<string> {
+  const enc = new TextEncoder()
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+  )
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+    keyMaterial, 256
+  )
+  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function generateId(len = 32): string {
+  const arr = new Uint8Array(len)
+  crypto.getRandomValues(arr)
+  return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// セッション有効期限（30日）
+const SESSION_DAYS = 30
+
+// ==========================================
+// 認証ミドルウェア
+// ==========================================
+async function requireAuth(c: any, next: any) {
+  const sessionId = getCookie(c, 'session_id')
+  if (!sessionId) return c.json({ error: 'Unauthorized' }, 401)
+
+  const session = await c.env.DB.prepare(
+    `SELECT s.*, u.email FROM sessions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.id = ? AND s.expires_at > datetime('now')`
+  ).bind(sessionId).first()
+
+  if (!session) {
+    deleteCookie(c, 'session_id')
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  c.set('userId', session.user_id)
+  c.set('userEmail', session.email)
+  await next()
 }
 
 // ランドマークインデックス定義 (MediaPipe Pose 33点)
@@ -21,7 +70,112 @@ const POSE_LANDMARKS = {
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
-app.use('/api/*', cors())
+app.use('/api/*', cors({ origin: '*', credentials: true }))
+
+// ==========================================
+// 認証API
+// ==========================================
+
+// 新規登録
+app.post('/api/auth/register', async (c) => {
+  try {
+    const { email, password } = await c.req.json()
+    if (!email || !password) return c.json({ error: 'メールアドレスとパスワードを入力してください' }, 400)
+    if (password.length < 8) return c.json({ error: 'パスワードは8文字以上にしてください' }, 400)
+
+    // 既存ユーザー確認
+    const existing = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()
+    if (existing) return c.json({ error: 'このメールアドレスはすでに登録されています' }, 409)
+
+    // パスワードハッシュ
+    const salt = generateId(16)
+    const hash = await hashPassword(password, salt)
+
+    // ユーザー作成
+    const result = await c.env.DB.prepare(
+      'INSERT INTO users (email, password_hash, password_salt) VALUES (?, ?, ?)'
+    ).bind(email, hash, salt).run()
+    const userId = result.meta.last_row_id as number
+
+    // セッション作成
+    const sessionId = generateId()
+    const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400 * 1000)
+      .toISOString().replace('T', ' ').substring(0, 19)
+    await c.env.DB.prepare(
+      'INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)'
+    ).bind(sessionId, userId, expiresAt).run()
+
+    setCookie(c, 'session_id', sessionId, {
+      httpOnly: true, secure: true, sameSite: 'Lax',
+      maxAge: SESSION_DAYS * 86400, path: '/'
+    })
+    return c.json({ success: true, email })
+  } catch (e) {
+    console.error(e)
+    return c.json({ error: '登録に失敗しました' }, 500)
+  }
+})
+
+// ログイン
+app.post('/api/auth/login', async (c) => {
+  try {
+    const { email, password } = await c.req.json()
+    if (!email || !password) return c.json({ error: 'メールアドレスとパスワードを入力してください' }, 400)
+
+    const user = await c.env.DB.prepare(
+      'SELECT * FROM users WHERE email = ?'
+    ).bind(email).first()
+    if (!user) return c.json({ error: 'メールアドレスまたはパスワードが正しくありません' }, 401)
+
+    const hash = await hashPassword(password, user.password_salt as string)
+    if (hash !== user.password_hash) return c.json({ error: 'メールアドレスまたはパスワードが正しくありません' }, 401)
+
+    // セッション作成
+    const sessionId = generateId()
+    const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400 * 1000)
+      .toISOString().replace('T', ' ').substring(0, 19)
+    await c.env.DB.prepare(
+      'INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)'
+    ).bind(sessionId, user.id, expiresAt).run()
+
+    setCookie(c, 'session_id', sessionId, {
+      httpOnly: true, secure: true, sameSite: 'Lax',
+      maxAge: SESSION_DAYS * 86400, path: '/'
+    })
+    return c.json({ success: true, email })
+  } catch (e) {
+    console.error(e)
+    return c.json({ error: 'ログインに失敗しました' }, 500)
+  }
+})
+
+// ログアウト
+app.post('/api/auth/logout', async (c) => {
+  const sessionId = getCookie(c, 'session_id')
+  if (sessionId) {
+    await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(sessionId).run()
+  }
+  deleteCookie(c, 'session_id', { path: '/' })
+  return c.json({ success: true })
+})
+
+// 認証状態確認
+app.get('/api/auth/me', async (c) => {
+  const sessionId = getCookie(c, 'session_id')
+  if (!sessionId) return c.json({ authenticated: false })
+
+  const session = await c.env.DB.prepare(
+    `SELECT u.email FROM sessions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.id = ? AND s.expires_at > datetime('now')`
+  ).bind(sessionId).first()
+
+  if (!session) {
+    deleteCookie(c, 'session_id', { path: '/' })
+    return c.json({ authenticated: false })
+  }
+  return c.json({ authenticated: true, email: session.email })
+})
 
 // ==========================================
 // 座標ベース分析API（WASMから呼ぶ）
@@ -283,14 +437,97 @@ app.get('/', (c) => {
 </head>
 <body class="bg-gradient-to-br from-slate-900 to-blue-950 min-h-screen text-white">
 
-<div class="max-w-3xl mx-auto px-4 py-10">
+<!-- ==================== ログイン・登録画面 ==================== -->
+<div id="authScreen" class="hidden min-h-screen flex items-center justify-center px-4">
+  <div class="w-full max-w-sm">
+    <!-- ロゴ -->
+    <div class="text-center mb-8">
+      <h1 class="text-4xl font-black tracking-tight mb-2">
+        <i class="fas fa-running text-blue-400 mr-2"></i>RunLens
+      </h1>
+      <p class="text-slate-400 text-sm">ランニングフォーム分析</p>
+    </div>
+
+    <!-- タブ -->
+    <div class="bg-slate-800/60 rounded-2xl p-1.5 mb-6 flex gap-1">
+      <button id="authTabLogin" onclick="switchAuthTab('login')"
+        class="tab-btn active flex-1 py-2.5 rounded-xl font-semibold text-sm">
+        ログイン
+      </button>
+      <button id="authTabRegister" onclick="switchAuthTab('register')"
+        class="tab-btn flex-1 py-2.5 rounded-xl font-semibold text-sm">
+        新規登録
+      </button>
+    </div>
+
+    <!-- ログインフォーム -->
+    <div id="loginForm" class="bg-slate-800/60 rounded-2xl p-6">
+      <div class="space-y-4">
+        <div>
+          <label class="text-sm text-slate-400 mb-1.5 block">メールアドレス</label>
+          <input id="loginEmail" type="email" placeholder="example@email.com"
+            class="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors">
+        </div>
+        <div>
+          <label class="text-sm text-slate-400 mb-1.5 block">パスワード</label>
+          <input id="loginPassword" type="password" placeholder="パスワード"
+            onkeydown="if(event.key==='Enter') doLogin()"
+            class="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors">
+        </div>
+        <p id="loginError" class="hidden text-red-400 text-xs"></p>
+        <button onclick="doLogin()"
+          class="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-bold text-sm transition-colors flex items-center justify-center gap-2">
+          <i class="fas fa-sign-in-alt"></i>ログイン
+        </button>
+      </div>
+    </div>
+
+    <!-- 登録フォーム -->
+    <div id="registerForm" class="hidden bg-slate-800/60 rounded-2xl p-6">
+      <div class="space-y-4">
+        <div>
+          <label class="text-sm text-slate-400 mb-1.5 block">メールアドレス</label>
+          <input id="registerEmail" type="email" placeholder="example@email.com"
+            class="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors">
+        </div>
+        <div>
+          <label class="text-sm text-slate-400 mb-1.5 block">パスワード <span class="text-slate-500">（8文字以上）</span></label>
+          <input id="registerPassword" type="password" placeholder="パスワード（8文字以上）"
+            class="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors">
+        </div>
+        <div>
+          <label class="text-sm text-slate-400 mb-1.5 block">パスワード確認</label>
+          <input id="registerPasswordConfirm" type="password" placeholder="パスワードを再入力"
+            onkeydown="if(event.key==='Enter') doRegister()"
+            class="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors">
+        </div>
+        <p id="registerError" class="hidden text-red-400 text-xs"></p>
+        <button onclick="doRegister()"
+          class="w-full bg-green-600 hover:bg-green-500 py-3 rounded-xl font-bold text-sm transition-colors flex items-center justify-center gap-2">
+          <i class="fas fa-user-plus"></i>アカウント作成
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== メインアプリ ==================== -->
+<div id="mainApp" class="hidden max-w-3xl mx-auto px-4 py-10">
 
   <!-- ヘッダー -->
-  <header class="text-center mb-10">
+  <header class="text-center mb-10 relative">
     <h1 class="text-4xl font-black tracking-tight mb-2">
       <i class="fas fa-running text-blue-400 mr-2"></i>RunLens
     </h1>
     <p class="text-slate-400">MediaPipe WASM によるブラウザ内ランニングフォーム分析</p>
+    <!-- ユーザー情報・ログアウト -->
+    <div class="absolute right-0 top-0 flex items-center gap-2">
+      <span id="userEmailBadge" class="text-xs text-slate-400"></span>
+      <button onclick="doLogout()"
+        class="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg transition-colors">
+        <i class="fas fa-sign-out-alt mr-1"></i>ログアウト
+      </button>
+    </div>
   </header>
 
   <!-- タブ切替 -->
@@ -633,12 +870,116 @@ app.get('/', (c) => {
     <button onclick="resetApp()" class="mt-4 bg-red-800 hover:bg-red-700 px-6 py-2 rounded-lg text-sm">やり直す</button>
   </div>
 
-</div>
+</div><!-- /mainApp -->
 
 <!-- MediaPipe Tasks Vision (CDN) -->
 <script type="module">
 import { PoseLandmarker, FilesetResolver, DrawingUtils }
   from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs'
+
+// ==========================================
+// 認証
+// ==========================================
+async function checkAuth() {
+  try {
+    const res = await fetch('/api/auth/me', { credentials: 'include' })
+    const data = await res.json()
+    if (data.authenticated) {
+      document.getElementById('userEmailBadge').textContent = data.email
+      document.getElementById('authScreen').classList.add('hidden')
+      document.getElementById('mainApp').classList.remove('hidden')
+    } else {
+      document.getElementById('authScreen').classList.remove('hidden')
+      document.getElementById('mainApp').classList.add('hidden')
+    }
+  } catch(e) {
+    document.getElementById('authScreen').classList.remove('hidden')
+    document.getElementById('mainApp').classList.add('hidden')
+  }
+}
+
+window.switchAuthTab = function(tab) {
+  const isLogin = tab === 'login'
+  document.getElementById('authTabLogin').classList.toggle('active', isLogin)
+  document.getElementById('authTabRegister').classList.toggle('active', !isLogin)
+  document.getElementById('loginForm').classList.toggle('hidden', !isLogin)
+  document.getElementById('registerForm').classList.toggle('hidden', isLogin)
+  document.getElementById('loginError').classList.add('hidden')
+  document.getElementById('registerError').classList.add('hidden')
+}
+
+window.doLogin = async function() {
+  const email    = document.getElementById('loginEmail').value.trim()
+  const password = document.getElementById('loginPassword').value
+  const errEl    = document.getElementById('loginError')
+  errEl.classList.add('hidden')
+
+  if (!email || !password) { errEl.textContent = 'メールアドレスとパスワードを入力してください'; errEl.classList.remove('hidden'); return }
+
+  const btn = document.querySelector('#loginForm button')
+  btn.disabled = true; btn.innerHTML = '<i class="fas fa-circle-notch fa-spin mr-2"></i>ログイン中...'
+
+  try {
+    const res  = await fetch('/api/auth/login', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    })
+    const data = await res.json()
+    if (!res.ok) { errEl.textContent = data.error; errEl.classList.remove('hidden'); return }
+    document.getElementById('userEmailBadge').textContent = data.email
+    document.getElementById('authScreen').classList.add('hidden')
+    document.getElementById('mainApp').classList.remove('hidden')
+  } catch(e) {
+    errEl.textContent = '通信エラーが発生しました'; errEl.classList.remove('hidden')
+  } finally {
+    btn.disabled = false; btn.innerHTML = '<i class="fas fa-sign-in-alt"></i>ログイン'
+  }
+}
+
+window.doRegister = async function() {
+  const email    = document.getElementById('registerEmail').value.trim()
+  const password = document.getElementById('registerPassword').value
+  const confirm  = document.getElementById('registerPasswordConfirm').value
+  const errEl    = document.getElementById('registerError')
+  errEl.classList.add('hidden')
+
+  if (!email || !password) { errEl.textContent = 'メールアドレスとパスワードを入力してください'; errEl.classList.remove('hidden'); return }
+  if (password.length < 8) { errEl.textContent = 'パスワードは8文字以上にしてください'; errEl.classList.remove('hidden'); return }
+  if (password !== confirm) { errEl.textContent = 'パスワードが一致しません'; errEl.classList.remove('hidden'); return }
+
+  const btn = document.querySelector('#registerForm button')
+  btn.disabled = true; btn.innerHTML = '<i class="fas fa-circle-notch fa-spin mr-2"></i>登録中...'
+
+  try {
+    const res  = await fetch('/api/auth/register', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    })
+    const data = await res.json()
+    if (!res.ok) { errEl.textContent = data.error; errEl.classList.remove('hidden'); return }
+    document.getElementById('userEmailBadge').textContent = data.email
+    document.getElementById('authScreen').classList.add('hidden')
+    document.getElementById('mainApp').classList.remove('hidden')
+  } catch(e) {
+    errEl.textContent = '通信エラーが発生しました'; errEl.classList.remove('hidden')
+  } finally {
+    btn.disabled = false; btn.innerHTML = '<i class="fas fa-user-plus"></i>アカウント作成'
+  }
+}
+
+window.doLogout = async function() {
+  await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+  document.getElementById('mainApp').classList.add('hidden')
+  document.getElementById('authScreen').classList.remove('hidden')
+  document.getElementById('loginEmail').value = ''
+  document.getElementById('loginPassword').value = ''
+  switchAuthTab('login')
+}
+
+// 起動時に認証チェック
+checkAuth()
 
 // ==========================================
 // グローバル状態
