@@ -5,5 +5,12 @@
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
     "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "webapp-production",
+      "database_id": "0a6f9f29-3bfe-40a2-824c-f17990c47409"
+    }
   ]
 }
