@@ -5,6 +5,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 type Bindings = {
   DB: D1Database
   R2: R2Bucket
+  AI: Ai
   OPENAI_API_KEY?: string
   OPENAI_BASE_URL?: string
 }
@@ -315,6 +316,72 @@ app.get('/api/sessions/:id/video', requireAuth, async (c) => {
     })
   } catch (e) {
     return c.json({ error: 'Failed to get video' }, 500)
+  }
+})
+
+// ==========================================
+// Workers AI フィードバック生成
+// ==========================================
+app.post('/api/analyze-ai', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { summary } = body as { summary: PoseSummary }
+    if (!summary) return c.json({ error: 'summary required' }, 400)
+
+    const footLabel =
+      summary.footStrikePattern === 'heel'     ? 'ヒールストライク' :
+      summary.footStrikePattern === 'midfoot'  ? 'ミッドフット' :
+      summary.footStrikePattern === 'forefoot' ? 'フォアフット' : '不明'
+
+    const prompt = `あなたはランニングバイオメカニクスの専門家です。
+以下はMediaPipe Poseで計測したランニングフォームの実測データです。
+このデータを根拠に、具体的な数値を引用しながら日本語でフィードバックしてください。
+
+## 計測データ
+- 体幹前傾角（平均）: ${summary.avgAngles.trunkLean.toFixed(1)}°（理想: 5〜10°）
+- 左膝角度（平均/最小/最大）: ${summary.avgAngles.leftKnee.toFixed(1)}° / ${summary.minAngles.leftKnee.toFixed(1)}° / ${summary.maxAngles.leftKnee.toFixed(1)}°
+- 右膝角度（平均/最小/最大）: ${summary.avgAngles.rightKnee.toFixed(1)}° / ${summary.minAngles.rightKnee.toFixed(1)}° / ${summary.maxAngles.rightKnee.toFixed(1)}°
+- 左肘角度（平均）: ${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: ${summary.avgAngles.rightElbow.toFixed(1)}°（理想: 85〜95°）
+- 左右対称スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（100%が完全対称）
+- 体幹安定スコア: ${summary.trunkStability.toFixed(2)}（1.0が最高）
+- 着地パターン: ${footLabel}
+- 解析フレーム数: ${summary.frameCount}フレーム / ${summary.duration.toFixed(1)}秒
+
+## 出力形式（JSON、必ずこの形式で返すこと）
+{
+  "strengths": ["良い点1（数値引用）", "良い点2", "良い点3"],
+  "improvements": ["改善点1（数値と理想値を示す）", "改善点2", "改善点3"],
+  "advice": "200字以内の総合アドバイス。体幹・膝・腕振り・着地の順で簡潔に。"
+}
+
+JSON以外の文字は一切出力しないこと。`
+
+    const response = await c.env.AI.run('@cf/meta/llama-3.1-8b-instruct' as any, {
+      messages: [
+        {
+          role: 'system',
+          content: 'ランニングバイオメカニクスの専門家として、実測データを根拠に具体的なフィードバックをJSON形式で返す。JSON以外は出力しない。',
+        },
+        { role: 'user', content: prompt },
+      ],
+      max_tokens: 1024,
+      temperature: 0.3,
+    }) as { response: string }
+
+    const raw = response.response ?? ''
+    // JSONブロックを抽出
+    const match = raw.match(/\{[\s\S]*\}/)
+    if (!match) return c.json({ error: 'AI response parse failed', raw }, 500)
+
+    const parsed = JSON.parse(match[0])
+    return c.json({
+      strengths:    Array.isArray(parsed.strengths)    ? parsed.strengths    : [],
+      improvements: Array.isArray(parsed.improvements) ? parsed.improvements : [],
+      advice:       typeof parsed.advice === 'string'  ? parsed.advice       : '',
+    })
+  } catch (e) {
+    console.error('Workers AI error:', e)
+    return c.json({ error: String(e) }, 500)
   }
 })
 
@@ -911,10 +978,37 @@ app.get('/', (c) => {
       <ul id="improvementsList" class="space-y-3"></ul>
     </div>
 
-    <!-- 詳細フィードバック -->
+    <!-- 詳細フィードバック（ルールベース） -->
     <div class="bg-gradient-to-br from-blue-900/50 to-purple-900/50 rounded-2xl p-6 mb-6">
       <h4 class="font-bold mb-4 text-blue-300"><i class="fas fa-comment-alt mr-2"></i>詳細フィードバック</h4>
       <pre id="detailedFeedback" class="whitespace-pre-wrap text-slate-300 text-sm leading-relaxed"></pre>
+    </div>
+
+    <!-- Workers AI フィードバック -->
+    <div id="aiFeedbackCard" class="bg-gradient-to-br from-violet-900/50 to-indigo-900/50 border border-violet-700/40 rounded-2xl p-6 mb-6">
+      <h4 class="font-bold mb-4 text-violet-300">
+        <i class="fas fa-robot mr-2"></i>AI アドバイス
+        <span class="text-xs font-normal text-slate-400 ml-2">Cloudflare Workers AI (Llama 3.1)</span>
+      </h4>
+      <!-- ローディング -->
+      <div id="aiLoading" class="flex items-center gap-3 text-slate-400 text-sm">
+        <svg class="animate-spin h-5 w-5 text-violet-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+        </svg>
+        AIがフォームを分析中...
+      </div>
+      <!-- 結果 -->
+      <div id="aiResult" class="hidden">
+        <div id="aiStrengths" class="mb-4"></div>
+        <div id="aiImprovements" class="mb-4"></div>
+        <div id="aiAdvice" class="bg-violet-900/30 rounded-xl p-4 text-slate-300 text-sm leading-relaxed border border-violet-700/30"></div>
+      </div>
+      <!-- エラー -->
+      <div id="aiError" class="hidden text-slate-400 text-sm">
+        <i class="fas fa-exclamation-circle text-yellow-500 mr-2"></i>
+        AIフィードバックの取得に失敗しました（ルールベース結果をご参照ください）
+      </div>
     </div>
 
     <!-- 名前をつけて保存 -->
@@ -2150,8 +2244,73 @@ function showResult(data, summary) {
   // 詳細フィードバック
   document.getElementById('detailedFeedback').textContent = data.detailed_feedback
 
+  // ── Workers AI フィードバック（非同期・バックグラウンド）──
+  fetchAIFeedback(summary)
+
   // ── ワイヤーフレームレビューをセットアップ ──
   setupReview()
+}
+
+// ==========================================
+// Workers AI フィードバック取得
+// ==========================================
+async function fetchAIFeedback(summary) {
+  const loading = document.getElementById('aiLoading')
+  const result  = document.getElementById('aiResult')
+  const error   = document.getElementById('aiError')
+
+  // ローディング状態にリセット
+  loading.classList.remove('hidden')
+  result.classList.add('hidden')
+  error.classList.add('hidden')
+
+  try {
+    const res = await fetch('/api/analyze-ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ summary }),
+    })
+    if (!res.ok) throw new Error(\`HTTP \${res.status}\`)
+    const ai = await res.json()
+
+    // 良い点（AI版）
+    document.getElementById('aiStrengths').innerHTML = ai.strengths?.length ? \`
+      <p class="text-xs font-semibold text-green-400 mb-2 uppercase tracking-wide">
+        <i class="fas fa-check-circle mr-1"></i>良い点
+      </p>
+      <ul class="space-y-2">
+        \${ai.strengths.map(s => \`
+          <li class="flex items-start gap-2 text-sm text-slate-300">
+            <i class="fas fa-check text-green-400 mt-0.5 shrink-0"></i>\${s}
+          </li>
+        \`).join('')}
+      </ul>
+    \` : ''
+
+    // 改善点（AI版）
+    document.getElementById('aiImprovements').innerHTML = ai.improvements?.length ? \`
+      <p class="text-xs font-semibold text-yellow-400 mb-2 uppercase tracking-wide">
+        <i class="fas fa-lightbulb mr-1"></i>改善点
+      </p>
+      <ul class="space-y-2">
+        \${ai.improvements.map(s => \`
+          <li class="flex items-start gap-2 text-sm text-slate-300">
+            <i class="fas fa-arrow-right text-yellow-400 mt-0.5 shrink-0"></i>\${s}
+          </li>
+        \`).join('')}
+      </ul>
+    \` : ''
+
+    // 総合アドバイス
+    document.getElementById('aiAdvice').textContent = ai.advice || ''
+
+    loading.classList.add('hidden')
+    result.classList.remove('hidden')
+  } catch (e) {
+    console.error('AI feedback error:', e)
+    loading.classList.add('hidden')
+    error.classList.remove('hidden')
+  }
 }
 
 // ==========================================
