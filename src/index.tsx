@@ -1934,17 +1934,25 @@ function symmetryScore(frames) {
   // ランニングは左右が逆位相で動くため、同フレームの差ではなく
   // 「動きの統計量の差」で非対称性を評価する
   //
-  // 膝: 平均差（閾値15°）+ 標準偏差差（閾値10°）
-  const kneeMeanDiff = Math.abs(avg(lKnee)  - avg(rKnee))
-  const kneeStdDiff  = Math.abs(std(lKnee)  - std(rKnee))
-  const kneeAsym     = kneeMeanDiff / 15 + kneeStdDiff / 10
+  // 閾値の根拠:
+  //   健常ランナーの左右平均差は 5〜15° が普通（カメラ誤差含む）
+  //   → 平均差の許容閾値: 20°（これ以上で非対称と判断）
+  //   標準偏差差の許容閾値: 15°
+  //
+  // 加算ではなく重み付き平均にすることで
+  //   片方が少しずれただけでスコアがゼロになるのを防ぐ
 
-  // 肘: 平均差（閾値15°）+ 標準偏差差（閾値10°）
+  // 膝
+  const kneeMeanDiff = Math.abs(avg(lKnee) - avg(rKnee))
+  const kneeStdDiff  = Math.abs(std(lKnee) - std(rKnee))
+  const kneeAsym     = (kneeMeanDiff / 20) * 0.6 + (kneeStdDiff / 15) * 0.4
+
+  // 肘
   const elbowMeanDiff = Math.abs(avg(lElbow) - avg(rElbow))
   const elbowStdDiff  = Math.abs(std(lElbow) - std(rElbow))
-  const elbowAsym     = elbowMeanDiff / 15 + elbowStdDiff / 10
+  const elbowAsym     = (elbowMeanDiff / 20) * 0.6 + (elbowStdDiff / 15) * 0.4
 
-  // kneeAsym / elbowAsym = 0 → 完全対称、≥1 → 明らかな非対称
+  // 0 → 完全対称、≥1 → 明らかな非対称
   const kneeScore  = Math.max(0, 1 - kneeAsym)
   const elbowScore = Math.max(0, 1 - elbowAsym)
 
