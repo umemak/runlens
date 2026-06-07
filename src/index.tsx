@@ -344,6 +344,8 @@ app.post('/api/analyze-ai', async (c) => {
 - 左肘角度（平均）: ${summary.avgAngles.leftElbow.toFixed(1)}°  右肘: ${summary.avgAngles.rightElbow.toFixed(1)}°（理想: 85〜95°）
 - 動作均等性スコア: ${(summary.symmetryScore * 100).toFixed(1)}%（膝・肘の動き幅・平均の左右均一さ。100%が完全均等）
 - 体幹安定スコア: ${summary.trunkStability.toFixed(2)}（1.0が最高）
+- ピッチ: ${summary.stride.pitchPerMin > 0 ? summary.stride.pitchPerMin + 'spm（理想: 170〜190spm）' : '検出不可'}
+- ストライド周期: ${summary.stride.strideTimeSec > 0 ? summary.stride.strideTimeSec.toFixed(2) + '秒' : '検出不可'}
 - 着地パターン: ${footLabel}
 - 解析フレーム数: ${summary.frameCount}フレーム / ${summary.duration.toFixed(1)}秒
 
@@ -407,9 +409,13 @@ type PoseSummary = {
   minAngles: FrameData['angles']
   maxAngles: FrameData['angles']
   symmetryScore: number       // 動作均等性 0-1（膝・肘の動き幅・平均の均一さ）
-  cadenceEstimate: number     // ストライド周期(fps換算)
   trunkStability: number      // 体幹安定度(分散の逆数)
   footStrikePattern: string   // 'forefoot' | 'midfoot' | 'heel'
+  stride: {
+    pitchPerMin:   number     // ピッチ（spm: ステップ数/分）
+    strideTimeSec: number     // ストライド周期（秒）
+    stepsDetected: number     // 検出ステップ数
+  }
 }
 
 // ==========================================
@@ -1972,6 +1978,98 @@ function trunkStability(frames) {
 }
 
 // ==========================================
+// ストライド検出（足首Y座標の極小点から周期・ピッチを推定）
+// ==========================================
+function detectStride(frames) {
+  // 戻り値のデフォルト
+  const unknown = { pitchPerMin: 0, strideTimeSec: 0, stepsDetected: 0 }
+  if (frames.length < 4) return unknown
+
+  // ── 左右の足首(27=左, 28=右)のY座標時系列を取得 ────────────────
+  // MediaPipeのY軸は下向きなので、接地（足が最も下）= Y値が最大
+  // → 極大点（local maximum）が「接地タイミング」
+
+  const FPS = frames[0] ? (frames.length / (frames[frames.length - 1].timestamp - frames[0].timestamp || 1)) : 10
+
+  // 左右それぞれの足首Y座標を取得（可視性0.3以上のフレームのみ）
+  function getAnkleY(side) {
+    const idx = side === 'left' ? 27 : 28
+    return frames.map(f => {
+      const lm = f.landmarks
+      if (!lm || lm.length <= idx) return null
+      const pt = lm[idx]
+      return (pt?.visibility ?? 0) > 0.3 ? pt.y : null
+    })
+  }
+
+  // ── スムージング（5点移動平均）────────────────────────────────
+  function smooth(arr, w = 5) {
+    return arr.map((v, i) => {
+      if (v === null) return null
+      const half = Math.floor(w / 2)
+      const slice = arr.slice(Math.max(0, i - half), Math.min(arr.length, i + half + 1))
+      const valid = slice.filter(x => x !== null)
+      return valid.length > 0 ? valid.reduce((s, x) => s + x, 0) / valid.length : null
+    })
+  }
+
+  // ── 極大点（接地タイミング）を検出 ───────────────────────────
+  // minGap: 連続した接地を誤検出しないための最小間隔（フレーム数）
+  function findPeaks(arr, minGap = 3) {
+    const peaks = []
+    for (let i = 1; i < arr.length - 1; i++) {
+      if (arr[i] === null || arr[i - 1] === null || arr[i + 1] === null) continue
+      if (arr[i] > arr[i - 1] && arr[i] > arr[i + 1]) {
+        // 直前のピークと近すぎる場合はスキップ
+        if (peaks.length === 0 || i - peaks[peaks.length - 1] >= minGap) {
+          peaks.push(i)
+        }
+      }
+    }
+    return peaks
+  }
+
+  const leftY  = smooth(getAnkleY('left'))
+  const rightY = smooth(getAnkleY('right'))
+
+  const leftPeaks  = findPeaks(leftY,  Math.max(3, Math.floor(FPS * 0.2)))
+  const rightPeaks = findPeaks(rightY, Math.max(3, Math.floor(FPS * 0.2)))
+
+  // ── 全ステップを時系列に並べて周期を計算 ──────────────────────
+  // 左右の接地タイミングを合わせてソート → 連続する接地間隔を計算
+  const allSteps = [
+    ...leftPeaks.map(i  => ({ t: frames[i].timestamp,  side: 'L' })),
+    ...rightPeaks.map(i => ({ t: frames[i].timestamp,  side: 'R' })),
+  ].sort((a, b) => a.t - b.t)
+
+  if (allSteps.length < 2) return unknown
+
+  // 連続ステップ間の時間差を収集（外れ値除去: 0.2s〜1.5s の範囲のみ）
+  const intervals = []
+  for (let i = 1; i < allSteps.length; i++) {
+    const dt = allSteps[i].t - allSteps[i - 1].t
+    if (dt >= 0.15 && dt <= 1.5) intervals.push(dt)
+  }
+
+  if (intervals.length === 0) return unknown
+
+  // 中央値でロバスト推定（外れ値に強い）
+  intervals.sort((a, b) => a - b)
+  const medianInterval = intervals[Math.floor(intervals.length / 2)]
+
+  // ストライド周期 = 同じ足の接地間隔 = ステップ間隔 × 2
+  const strideTimeSec = medianInterval * 2
+  // ピッチ（spm: steps per minute）= 1分 / ステップ間隔
+  const pitchPerMin   = Math.round(60 / medianInterval)
+
+  return {
+    pitchPerMin,                       // ステップ数/分（spm）
+    strideTimeSec: +strideTimeSec.toFixed(2),  // ストライド周期（秒）
+    stepsDetected: allSteps.length,    // 検出したステップ数
+  }
+}
+
+// ==========================================
 // サンプルフレーム均等抽出
 // ==========================================
 function sampleFrames(frames, n = 10) {
@@ -2074,9 +2172,9 @@ window.startAnalysis = async function() {
     minAngles:        min,
     maxAngles:        max,
     symmetryScore:    symmetryScore(poseFrames),
-    cadenceEstimate:  0,
     trunkStability:   trunkStability(poseFrames),
     footStrikePattern: detectFootStrike(poseFrames),
+    stride:           detectStride(poseFrames),
   }
 
   onProgress(100, '解析完了！結果を計算中...')
@@ -2103,12 +2201,30 @@ function calcLocalScores(summary) {
                                   : 50 + Math.round(summary.trunkStability * 5)
   const postureScoreClamped = Math.min(100, Math.max(30, postureScore))
 
-  // --- ストライドスコア（膝角度の範囲と動作均等性）---
+  // --- ストライドスコア（ピッチ + 膝角度範囲 + 動作均等性）---
   const kneeRange   = summary.maxAngles.leftKnee - summary.minAngles.leftKnee
   const kneeRangeOk = kneeRange >= 20 && kneeRange <= 60
   const symPct      = summary.symmetryScore * 100
+  const pitch       = summary.stride.pitchPerMin
+
+  // ピッチスコア（理想: 170〜190spm、Elite: 180spm前後）
+  // ピッチが検出できない場合(0)は中立評価(70)とする
+  let pitchScore = 70  // 未検出時の中立値
+  if (pitch > 0) {
+    if      (pitch >= 170 && pitch <= 190) pitchScore = 95  // 理想範囲
+    else if (pitch >= 160 && pitch <  170) pitchScore = 80  // やや低い
+    else if (pitch >  190 && pitch <= 200) pitchScore = 80  // やや高い
+    else if (pitch >= 150 && pitch <  160) pitchScore = 65  // 低い
+    else if (pitch >  200)                 pitchScore = 65  // 高すぎ
+    else                                   pitchScore = 50  // 150未満
+  }
+
+  // 膝スコア（可動域が適切か）
+  const kneeScore = kneeRangeOk ? 80 : 60
+
+  // ストライドスコア = ピッチ40% + 膝可動域30% + 動作均等性30%
   const strideScore = Math.round(
-    (kneeRangeOk ? 80 : 60) * 0.5 + symPct * 0.5
+    pitchScore * 0.4 + kneeScore * 0.3 + symPct * 0.3
   )
   const strideScoreClamped = Math.min(100, Math.max(30, strideScore))
 
@@ -2132,6 +2248,7 @@ function calcLocalScores(summary) {
   const strengths = []
   if (trunkIdeal) strengths.push(\`体幹前傾角 \${trunkLean.toFixed(1)}° は理想範囲（5〜10°）です\`)
   if (symPct >= 90) strengths.push(\`動作均等性 \${symPct.toFixed(1)}% — 左右の膝・肘の動き幅がよく揃っています\`)
+  if (pitch >= 170 && pitch <= 190) strengths.push(\`ピッチ \${pitch}spm — 理想的なケイデンスです（目標: 170〜190spm）\`)
   if (elbowIdeal) strengths.push(\`肘角度 \${avgElbow.toFixed(1)}° — 腕振りが適切です\`)
   if (summary.footStrikePattern === 'midfoot') strengths.push('ミッドフット着地でひざへの衝撃が少ないフォームです')
   if (summary.footStrikePattern === 'forefoot') strengths.push('フォアフット着地でランニングエコノミーに優れています')
@@ -2155,6 +2272,12 @@ function calcLocalScores(summary) {
   if (kneeRange < 15) {
     improvements.push('膝の屈伸範囲が小さいです。ストライドを意識して膝をしっかり曲げると推進力が上がります')
   }
+  if (pitch > 0 && pitch < 160) {
+    improvements.push(\`ピッチ \${pitch}spm — 理想は170〜190spm。歩幅を小さくしてピッチを上げると効率が向上します\`)
+  }
+  if (pitch > 200) {
+    improvements.push(\`ピッチ \${pitch}spm — やや高すぎます。力みを抜いてリラックスして走りましょう\`)
+  }
   if (improvements.length === 0) improvements.push('全体的にバランスの取れたフォームです。引き続き継続してください')
 
   // --- 詳細フィードバック ---
@@ -2166,7 +2289,14 @@ function calcLocalScores(summary) {
     \`体幹安定スコア: \${summary.trunkStability.toFixed(2)}\`,
     trunkIdeal ? '→ 理想的な前傾角度で推進力を最大化できています。' : \`→ 前傾角度を調整することでさらに効率が向上します。\`,
     '',
-    '【ストライド・膝】',
+    '【ストライド・ピッチ】',
+    pitch > 0
+      ? \`ピッチ: \${pitch}spm（\${summary.stride.strideTimeSec.toFixed(2)}秒/ストライド）理想: 170〜190spm\`
+      : 'ピッチ: 検出不可（動画が短いか足首が映っていない可能性があります）',
+    pitch > 0 ? (pitch >= 170 && pitch <= 190 ? '→ 理想的なピッチです。' : pitch < 170 ? \`→ ピッチが低め。歩幅を縮めてピッチを上げると省エネになります。\` : '→ ピッチが高め。力みを抜いてリラックスして走りましょう。') : '',
+    \`検出ステップ数: \${summary.stride.stepsDetected}歩\`,
+    '',
+    '【膝・動作均等性】',
     \`左膝平均: \${summary.avgAngles.leftKnee.toFixed(1)}°  右膝平均: \${summary.avgAngles.rightKnee.toFixed(1)}°\`,
     \`膝角度範囲: \${summary.minAngles.leftKnee.toFixed(1)}°〜\${summary.maxAngles.leftKnee.toFixed(1)}°\`,
     \`動作均等性: \${symPct.toFixed(1)}%（膝・肘の動き幅の均一さ）\`,
@@ -2235,7 +2365,15 @@ function showResult(data, summary) {
   document.getElementById('footScore').textContent     = data.foot_strike_score
 
   // 実測値サマリー
+  const pitchStr  = summary.stride.pitchPerMin > 0
+    ? summary.stride.pitchPerMin + ' spm'
+    : '検出不可'
+  const strideStr = summary.stride.strideTimeSec > 0
+    ? summary.stride.strideTimeSec.toFixed(2) + ' 秒/stride'
+    : '—'
   const metrics = [
+    ['ピッチ',      pitchStr],
+    ['ストライド周期', strideStr],
     ['体幹前傾角', summary.avgAngles.trunkLean.toFixed(1) + '°（理想: 5〜10°）'],
     ['左膝平均角', summary.avgAngles.leftKnee.toFixed(1) + '°'],
     ['右膝平均角', summary.avgAngles.rightKnee.toFixed(1) + '°'],
