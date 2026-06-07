@@ -251,7 +251,9 @@ app.get('/api/sessions', requireAuth, async (c) => {
     const userId = c.get('userId') as number
     const rows = await c.env.DB.prepare(`
       SELECT id, name, video_key, overall_score, posture_score, stride_score,
-             arm_swing_score, foot_strike_score, summary, vector, created_at
+             arm_swing_score, foot_strike_score,
+             strengths, improvements, detailed_feedback,
+             summary, vector, created_at
       FROM analyses
       WHERE user_id = ? AND status = 'completed'
       ORDER BY created_at DESC
@@ -259,6 +261,8 @@ app.get('/api/sessions', requireAuth, async (c) => {
 
     const sessions = rows.results.map((r: any) => ({
       ...r,
+      strengths:   r.strengths   ? JSON.parse(r.strengths)   : [],
+      improvements: r.improvements ? JSON.parse(r.improvements) : [],
       summary: r.summary ? JSON.parse(r.summary) : null,
       vector:  r.vector  ? JSON.parse(r.vector)  : [],
     }))
@@ -1410,9 +1414,9 @@ async function renderSessionList() {
             <div class="flex items-start justify-between gap-2">
               <p class="font-semibold text-sm truncate">\${s.name}</p>
               <div class="flex gap-1.5 flex-shrink-0">
-                \${hasVideo ? \`<button onclick="playSessionVideo(\${s.id})"
-                  class="bg-slate-600 hover:bg-slate-500 text-xs px-2.5 py-1 rounded-lg transition-colors"
-                  title="動画を再生"><i class="fas fa-play mr-1"></i>再生</button>\` : ''}
+                <button onclick="playSessionResult(\${s.id})"
+                  class="bg-blue-700 hover:bg-blue-600 text-xs px-2.5 py-1 rounded-lg transition-colors"
+                  title="結果を表示"><i class="fas fa-chart-bar mr-1"></i>結果</button>
                 <button onclick="findSimilar(\${s.id})"
                   class="bg-cyan-700 hover:bg-cyan-600 text-xs px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap"
                   title="この記録に似たフォームを検索">
@@ -1442,19 +1446,56 @@ async function renderSessionList() {
   }
 }
 
-// 履歴から動画を再生
-window.playSessionVideo = function(id) {
-  const url = \`/api/sessions/\${id}/video\`
-  const rv  = document.getElementById('reviewVideo')
-  if (!rv) return
-  // 結果セクションを表示して動画をセット
-  show('resultSection')
+// 履歴から結果を復元して表示
+window.playSessionResult = function(id) {
+  if (_cachedSessions.length === 0) return
+  const s = _cachedSessions.find(s => s.id === id)
+  if (!s || !s.summary) { alert('このセッションの解析データが見つかりません'); return }
+
+  // result オブジェクトを再構築
+  const result = {
+    overall_score:     s.overall_score,
+    posture_score:     s.posture_score,
+    stride_score:      s.stride_score,
+    arm_swing_score:   s.arm_swing_score,
+    foot_strike_score: s.foot_strike_score,
+    strengths:         s.strengths   || [],
+    improvements:      s.improvements || [],
+    detailed_feedback: s.detailed_feedback || '',
+  }
+
+  // showResult で全UI復元
+  showResult(result, s.summary)
+
+  // 保存済みバッジを表示（再保存不要）
+  currentSavedId = s.id
+  document.getElementById('savedBadge').classList.remove('hidden')
+  document.getElementById('savedName').textContent = s.name
+  const saveBtn = document.getElementById('saveSessionBtn')
+  saveBtn.disabled = true
+  saveBtn.innerHTML = '<i class="fas fa-check"></i> 保存済み'
+  saveBtn.classList.replace('bg-green-600', 'bg-slate-600')
+  document.getElementById('sessionNameInput').value    = s.name
+  document.getElementById('sessionNameInput').disabled = true
+
+  // 動画があればセット
+  const rv = document.getElementById('reviewVideo')
+  if (rv) {
+    if (s.video_key && s.video_key.startsWith('users/')) {
+      rv.src = \`/api/sessions/\${id}/video\`
+      rv.load()
+    } else {
+      rv.src = ''
+    }
+  }
+
+  // 画面遷移
   hide('historySection')
-  rv.src = url
-  rv.load()
-  rv.play()
   document.getElementById('tabFileBtn').classList.remove('active')
   document.getElementById('tabHistBtn').classList.remove('active')
+
+  // AIフィードバックは再取得しない（履歴表示では非表示）
+  document.getElementById('aiFeedbackCard').classList.add('hidden')
 }
 
 // セッション削除
