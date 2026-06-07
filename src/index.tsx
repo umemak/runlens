@@ -2123,14 +2123,14 @@ const HELP_TEXTS = {
   },
 }
 
-function showHelp(key) {
+window.showHelp = function(key) {
   const info = HELP_TEXTS[key]
   if (!info) return
-  hideHelp()
+  window.hideHelp()
   const overlay = document.createElement('div')
   overlay.className = 'help-overlay'
   overlay.id = 'helpOverlay'
-  overlay.onclick = hideHelp
+  overlay.onclick = window.hideHelp
   document.body.appendChild(overlay)
 
   const popup = document.createElement('div')
@@ -2146,7 +2146,7 @@ function showHelp(key) {
   document.body.appendChild(popup)
 }
 
-function hideHelp() {
+window.hideHelp = function() {
   document.getElementById('helpOverlay')?.remove()
   document.getElementById('helpPopup')?.remove()
 }
