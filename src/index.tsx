@@ -1482,10 +1482,9 @@ window.playSessionResult = function(id) {
   if (s.video_key && s.video_key.startsWith('users/')) {
     setupReviewFromUrl(\`/api/sessions/\${id}/video\`)
   } else {
-    // 動画なし：canvas だけ初期化しておく
-    const rv = document.getElementById('reviewVideo')
-    initReviewCanvas(rv)
-    rv.src = ''
+    // 動画なし：ctx だけ初期化
+    initReviewCanvas()
+    document.getElementById('reviewVideo').src = ''
   }
 
   // 画面遷移
@@ -2701,47 +2700,68 @@ async function fetchAIFeedback(summary) {
 // ==========================================
 // ワイヤーフレームレビュー
 // ==========================================
-// canvas/ctx の初期化とイベント登録（動画ソースは設定しない）
-function initReviewCanvas(rv) {
-  const rc  = document.getElementById('reviewCanvas')
-  reviewCtx = rc.getContext('2d')
+
+// イベントハンドラを保持してクリーンアップできるようにする
+let _rvHandlers = null
+
+function _teardownReviewListeners() {
+  if (!_rvHandlers) return
+  const rv = document.getElementById('reviewVideo')
+  rv.removeEventListener('loadedmetadata', _rvHandlers.meta)
+  rv.removeEventListener('timeupdate',     _rvHandlers.time)
+  rv.removeEventListener('ended',          _rvHandlers.ended)
+  _rvHandlers = null
+}
+
+// canvas/ctx の初期化とイベント登録
+function initReviewCanvas() {
+  const rv = document.getElementById('reviewVideo')
+  const rc = document.getElementById('reviewCanvas')
+
+  // 古いリスナーを除去してから再登録
+  _teardownReviewListeners()
+
+  reviewCtx       = rc.getContext('2d')
   reviewDrawUtils = new DrawingUtils(reviewCtx)
 
-  rv.addEventListener('loadedmetadata', () => {
-    rc.width  = rv.videoWidth
-    rc.height = rv.videoHeight
+  const onMeta = () => {
+    rc.width  = rv.videoWidth  || 640
+    rc.height = rv.videoHeight || 360
     const seekEl = document.getElementById('reviewSeek')
     seekEl.max   = rv.duration
-    document.getElementById('reviewDuration').textContent = rv.duration.toFixed(1) + 's'
+    seekEl.value = 0
+    document.getElementById('reviewDuration').textContent    = rv.duration.toFixed(1) + 's'
+    document.getElementById('reviewCurrentTime').textContent = '0.0s'
     renderReviewFrame()
-  }, { once: true })
-
-  rv.addEventListener('timeupdate', () => {
-    document.getElementById('reviewSeek').value             = rv.currentTime
+  }
+  const onTime = () => {
+    document.getElementById('reviewSeek').value              = rv.currentTime
     document.getElementById('reviewCurrentTime').textContent = rv.currentTime.toFixed(1) + 's'
     renderReviewFrame()
-  })
+  }
+  const onEnded = () => {
+    document.getElementById('playPauseBtn').innerHTML = '<i class="fas fa-play mr-1"></i>再生'
+  }
 
-  rv.addEventListener('ended', () => {
-    document.getElementById('playPauseBtn').innerHTML =
-      '<i class="fas fa-play mr-1"></i>再生'
-  })
+  rv.addEventListener('loadedmetadata', onMeta,   { once: true })
+  rv.addEventListener('timeupdate',     onTime)
+  rv.addEventListener('ended',          onEnded)
+  _rvHandlers = { meta: onMeta, time: onTime, ended: onEnded }
 }
 
-// 通常解析後の reviewVideo セットアップ（selectedFile から objectURL を作成）
+// 通常解析後（selectedFile から objectURL を作成）
 function setupReview() {
-  const rv = document.getElementById('reviewVideo')
-  initReviewCanvas(rv)
-  if (reviewVideoUrl) URL.revokeObjectURL(reviewVideoUrl)
+  if (reviewVideoUrl) { URL.revokeObjectURL(reviewVideoUrl); reviewVideoUrl = null }
   reviewVideoUrl = URL.createObjectURL(selectedFile)
-  rv.src = reviewVideoUrl
+  initReviewCanvas()
+  document.getElementById('reviewVideo').src = reviewVideoUrl
 }
 
-// 履歴再生用セットアップ（URLを直接セット）
+// 履歴再生用（API URL を直接セット）
 function setupReviewFromUrl(url) {
-  const rv = document.getElementById('reviewVideo')
-  initReviewCanvas(rv)
   if (reviewVideoUrl) { URL.revokeObjectURL(reviewVideoUrl); reviewVideoUrl = null }
+  initReviewCanvas()
+  const rv = document.getElementById('reviewVideo')
   rv.src = url
   rv.load()
 }
