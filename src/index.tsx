@@ -1464,8 +1464,8 @@ window.playSessionResult = function(id) {
     detailed_feedback: s.detailed_feedback || '',
   }
 
-  // showResult で全UI復元
-  showResult(result, s.summary)
+  // showResult で全UI復元（selectedFile が null のため setupReview はスキップ）
+  showResult(result, s.summary, true)
 
   // 保存済みバッジを表示（再保存不要）
   currentSavedId = s.id
@@ -1478,12 +1478,13 @@ window.playSessionResult = function(id) {
   document.getElementById('sessionNameInput').value    = s.name
   document.getElementById('sessionNameInput').disabled = true
 
-  // 動画があればセット
+  // 動画があれば reviewVideo にセット
   const rv = document.getElementById('reviewVideo')
   if (rv) {
     if (s.video_key && s.video_key.startsWith('users/')) {
       rv.src = \`/api/sessions/\${id}/video\`
       rv.load()
+      rv.play().catch(() => {})
     } else {
       rv.src = ''
     }
@@ -2548,7 +2549,7 @@ function calcLocalScores(summary) {
 // ==========================================
 // 結果表示
 // ==========================================
-function showResult(data, summary) {
+function showResult(data, summary, skipReview = false) {
   hide('progressSection')
   show('resultSection')
 
@@ -2634,7 +2635,7 @@ function showResult(data, summary) {
   fetchAIFeedback(summary)
 
   // ── ワイヤーフレームレビューをセットアップ ──
-  setupReview()
+  if (!skipReview) setupReview()
 }
 
 // ==========================================
