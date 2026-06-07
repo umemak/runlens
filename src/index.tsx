@@ -2052,25 +2052,25 @@ const HELP_TEXTS = {
   posture: {
     title: '姿勢・体幹スコア',
     desc: '体幹前傾角と体幹安定度から算出します。前傾角が理想範囲かつ安定した姿勢を保てているほど高スコアになります。',
-    formula: 'trunkIdeal(5〜10°) → 90 + 安定度×5\ntrunkOk(0〜5° or 10〜15°) → 70 + 安定度×5\nそれ以外 → 50 + 安定度×5',
+    formula: 'trunkIdeal(5〜10°) → 90 + 安定度×5 | trunkOk(0〜5° or 10〜15°) → 70 + 安定度×5 | それ以外 → 50 + 安定度×5',
     ideal: '体幹前傾角: 5〜10°（理想）',
   },
   stride: {
     title: 'ストライドスコア',
     desc: 'ピッチ（足回転数）・膝可動域・動作均等性の3項目を重み付き合算します。',
-    formula: 'ストライドスコア = ピッチ×40% + 膝スコア×30% + 動作均等性%×30%\n\nピッチ評価: 170〜190 spm → 95点\n160〜170 / 190〜200 → 80点\n150〜160 / 200〜210 → 65点\nそれ以外 → 45点',
+    formula: 'ストライドスコア = ピッチ×40% + 膝×30% + 均等性×30% | ピッチ評価: 170〜190spm→95点 / 160〜170→80点 / 150〜160→65点 / それ以外→45点',
     ideal: 'ピッチ: 170〜190 spm（理想）',
   },
   arm: {
     title: '腕振りスコア',
     desc: '肘の屈曲角度（平均）と左右差（非対称ペナルティ）から算出します。',
-    formula: '肘角度 85〜95° → 90点ベース\n±10° → 75点ベース\n±20° → 55点ベース\n左右差 >15° → −10点（ペナルティ）',
+    formula: '肘角度 85〜95°→90点 / ±10°→75点 / ±20°→55点 | 左右差 >15° → −10点（ペナルティ）',
     ideal: '肘角度: 85〜95°（理想）、左右対称',
   },
   foot: {
     title: '着地スコア',
     desc: '踵(lm29/30)とつま先(lm31/32)のY座標差から着地パターンを分類しスコアを付与します。',
-    formula: 'フォアフット（つま先先行） → 90点\nミッドフット（ほぼ同時） → 82点\nヒールストライク（踵先行） → 62点',
+    formula: 'フォアフット（つま先先行）→90点 | ミッドフット（ほぼ同時）→82点 | ヒールストライク（踵先行）→62点',
     ideal: 'フォアフット〜ミッドフットが理想',
   },
   pitch: {
@@ -2088,37 +2088,37 @@ const HELP_TEXTS = {
   trunkLean: {
     title: '体幹前傾角',
     desc: '股関節中点→肩中点ベクトルと垂直軸(0,−1)のなす角。MediaPipeのY軸は下向きのため符号を補正しています。',
-    formula: 'hip_mid = (lm23 + lm24) / 2\nshoulder_mid = (lm11 + lm12) / 2\nvec = shoulder_mid − hip_mid\nangle = atan2(vec.x, −vec.y) × (180/π)',
+    formula: 'hip_mid = (lm23+lm24)/2 | shoulder_mid = (lm11+lm12)/2 | vec = shoulder_mid − hip_mid | angle = atan2(vec.x, −vec.y) × (180/π)',
     ideal: '5〜10° の前傾が理想',
   },
   leftKnee: {
     title: '左膝平均角',
     desc: '左股関節(lm23)・左膝(lm25)・左足首(lm27)の3点から各フレームの膝屈曲角を求め平均します。',
-    formula: 'angle = arccos(dot(v1,v2) / (|v1|×|v2|))\nv1 = hip−knee, v2 = ankle−knee',
+    formula: 'angle = arccos(dot(v1,v2) / (|v1|×|v2|)) | v1 = hip−knee, v2 = ankle−knee',
     ideal: '走行中は概ね 130〜170°（ストライドにより変動）',
   },
   rightKnee: {
     title: '右膝平均角',
     desc: '右股関節(lm24)・右膝(lm26)・右足首(lm28)の3点から各フレームの膝屈曲角を求め平均します。',
-    formula: 'angle = arccos(dot(v1,v2) / (|v1|×|v2|))\nv1 = hip−knee, v2 = ankle−knee',
+    formula: 'angle = arccos(dot(v1,v2) / (|v1|×|v2|)) | v1 = hip−knee, v2 = ankle−knee',
     ideal: '左右差が小さいほど均等な走りを示す',
   },
   symmetry: {
     title: '動作均等性',
     desc: '左右の膝角・肘角の平均値差と標準偏差差を重み付き比較。左右が逆位相のため同フレーム比較ではなく統計量比較を採用しています。',
-    formula: 'score = 1 − (0.6×|avg_L−avg_R|/20° + 0.4×|std_L−std_R|/15°)\n100%が完全均等。値が高いほど左右バランスが良い。',
+    formula: 'score = 1 − (0.6×|avg_L−avg_R|/20° + 0.4×|std_L−std_R|/15°) | 100%が完全均等。高いほど左右バランスが良い。',
     ideal: '90%以上が目標',
   },
   trunkStability: {
     title: '体幹安定度',
     desc: '体幹前傾角の時系列分散の逆数から求めます。分散が小さい（姿勢が安定）ほど高い値になります。',
-    formula: 'trunkStability = 1 / √variance（上限1.0）\nvariance < 1 の場合は 1.0（安定）とみなす',
+    formula: 'trunkStability = 1 / √variance（上限1.0） | variance < 1 の場合は 1.0（安定）とみなす',
     ideal: '0.8以上が目安（1.0が最高）',
   },
   footPattern: {
     title: '着地パターン',
     desc: '各フレームで踵ランドマーク(lm29/30)とつま先ランドマーク(lm31/32)のY座標を比較し、最も多いパターンを判定します（Y軸は下向き）。',
-    formula: 'heel_y > toe_y + threshold → フォアフット\nabs(heel_y − toe_y) ≤ threshold → ミッドフット\ntoe_y > heel_y + threshold → ヒールストライク',
+    formula: 'heel_y > toe_y+threshold → フォアフット | |heel_y−toe_y| ≤ threshold → ミッドフット | toe_y > heel_y+threshold → ヒールストライク',
     ideal: 'フォアフット〜ミッドフットが推奨',
   },
 }
@@ -2140,7 +2140,7 @@ function showHelp(key) {
     <button class="help-close" onclick="hideHelp()" title="閉じる">✕</button>
     <h5><span style="color:#7dd3fc">?</span> \${info.title}</h5>
     <p>\${info.desc}</p>
-    \${info.formula ? \`<div class="formula">\${info.formula.replace(/\\n/g,'<br>')}</div>\` : ''}
+    \${info.formula ? \`<div class="formula">\${info.formula.replace(/\\|/g,'<br>')}</div>\` : ''}
     \${info.ideal ? \`<div class="ideal">✓ 理想値: \${info.ideal}</div>\` : ''}
   \`
   document.body.appendChild(popup)
