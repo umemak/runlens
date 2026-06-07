@@ -595,6 +595,53 @@ app.get('/', (c) => {
       background:#16a34a; color:white; font-size:.7rem;
       padding:2px 8px; border-radius:999px; font-weight:700;
     }
+    /* ヘルプポップアップ */
+    .help-btn {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:16px; height:16px; border-radius:50%;
+      background:rgba(148,163,184,.25); color:#94a3b8;
+      font-size:.6rem; font-weight:700; cursor:pointer;
+      border:1px solid rgba(148,163,184,.35);
+      transition:all .15s; flex-shrink:0; margin-left:4px;
+      vertical-align:middle; line-height:1;
+      user-select:none;
+    }
+    .help-btn:hover { background:rgba(99,179,237,.35); color:#93c5fd; border-color:#93c5fd; }
+    .help-overlay {
+      position:fixed; inset:0; z-index:9998;
+      background:rgba(0,0,0,.55); backdrop-filter:blur(2px);
+    }
+    .help-popup {
+      position:fixed; z-index:9999;
+      left:50%; top:50%; transform:translate(-50%,-50%);
+      width:min(92vw, 380px);
+      background:linear-gradient(135deg,#1e293b,#0f172a);
+      border:1px solid rgba(99,179,237,.35);
+      border-radius:16px; padding:20px 22px 18px;
+      box-shadow:0 8px 40px rgba(0,0,0,.6);
+    }
+    .help-popup h5 {
+      font-size:.95rem; font-weight:700; color:#bfdbfe;
+      margin-bottom:10px; display:flex; align-items:center; gap:6px;
+    }
+    .help-popup p { font-size:.8rem; color:#cbd5e1; line-height:1.6; margin-bottom:6px; }
+    .help-popup .formula {
+      background:rgba(30,58,138,.35); border:1px solid rgba(99,179,237,.25);
+      border-radius:8px; padding:8px 10px; font-size:.75rem;
+      color:#7dd3fc; font-family:monospace; margin:8px 0;
+      word-break:break-all;
+    }
+    .help-popup .ideal {
+      background:rgba(5,150,105,.2); border:1px solid rgba(52,211,153,.25);
+      border-radius:8px; padding:6px 10px; font-size:.75rem; color:#6ee7b7; margin:6px 0;
+    }
+    .help-close {
+      position:absolute; top:10px; right:14px;
+      background:none; border:none; color:#64748b; font-size:1.1rem;
+      cursor:pointer; line-height:1; padding:2px 6px;
+      transition:color .15s;
+    }
+    .help-close:hover { color:#f1f5f9; }
   </style>
 </head>
 <body class="bg-gradient-to-br from-slate-900 to-blue-950 min-h-screen text-white">
@@ -938,7 +985,10 @@ app.get('/', (c) => {
           <span class="text-xs text-slate-500">/ 100</span>
         </div>
       </div>
-      <h3 class="text-xl font-bold">総合スコア</h3>
+      <h3 class="text-xl font-bold">
+        総合スコア
+        <button class="help-btn" onclick="showHelp('overall')" title="説明">?</button>
+      </h3>
       <p class="text-sm text-slate-400 mt-1">MediaPipe骨格データによるルールベース分析</p>
     </div>
 
@@ -946,22 +996,34 @@ app.get('/', (c) => {
     <div class="grid grid-cols-2 gap-4 mb-6">
       <div class="bg-slate-800/60 rounded-xl p-5 text-center">
         <i class="fas fa-male text-blue-400 text-2xl mb-2"></i>
-        <p class="text-xs text-slate-400 mb-1">姿勢・体幹</p>
+        <p class="text-xs text-slate-400 mb-1">
+          姿勢・体幹
+          <button class="help-btn" onclick="showHelp('posture')" title="説明">?</button>
+        </p>
         <p class="text-3xl font-black"><span id="postureScore"></span><span class="text-base text-slate-400">点</span></p>
       </div>
       <div class="bg-slate-800/60 rounded-xl p-5 text-center">
         <i class="fas fa-shoe-prints text-green-400 text-2xl mb-2"></i>
-        <p class="text-xs text-slate-400 mb-1">ストライド</p>
+        <p class="text-xs text-slate-400 mb-1">
+          ストライド
+          <button class="help-btn" onclick="showHelp('stride')" title="説明">?</button>
+        </p>
         <p class="text-3xl font-black"><span id="strideScore"></span><span class="text-base text-slate-400">点</span></p>
       </div>
       <div class="bg-slate-800/60 rounded-xl p-5 text-center">
         <i class="fas fa-hands text-purple-400 text-2xl mb-2"></i>
-        <p class="text-xs text-slate-400 mb-1">腕振り</p>
+        <p class="text-xs text-slate-400 mb-1">
+          腕振り
+          <button class="help-btn" onclick="showHelp('arm')" title="説明">?</button>
+        </p>
         <p class="text-3xl font-black"><span id="armScore"></span><span class="text-base text-slate-400">点</span></p>
       </div>
       <div class="bg-slate-800/60 rounded-xl p-5 text-center">
         <i class="fas fa-walking text-orange-400 text-2xl mb-2"></i>
-        <p class="text-xs text-slate-400 mb-1">着地</p>
+        <p class="text-xs text-slate-400 mb-1">
+          着地
+          <button class="help-btn" onclick="showHelp('foot')" title="説明">?</button>
+        </p>
         <p class="text-3xl font-black"><span id="footScore"></span><span class="text-base text-slate-400">点</span></p>
       </div>
     </div>
@@ -1978,6 +2040,118 @@ function trunkStability(frames) {
 }
 
 // ==========================================
+// ヘルプポップアップ
+// ==========================================
+const HELP_TEXTS = {
+  overall: {
+    title: '総合スコア',
+    desc: '4つの評価項目（姿勢・体幹、ストライド、腕振り、着地）の単純平均です。',
+    formula: '総合スコア = (姿勢 + ストライド + 腕振り + 着地) / 4',
+    ideal: '高いほど良い（100点満点）',
+  },
+  posture: {
+    title: '姿勢・体幹スコア',
+    desc: '体幹前傾角と体幹安定度から算出します。前傾角が理想範囲かつ安定した姿勢を保てているほど高スコアになります。',
+    formula: 'trunkIdeal(5〜10°) → 90 + 安定度×5\ntrunkOk(0〜5° or 10〜15°) → 70 + 安定度×5\nそれ以外 → 50 + 安定度×5',
+    ideal: '体幹前傾角: 5〜10°（理想）',
+  },
+  stride: {
+    title: 'ストライドスコア',
+    desc: 'ピッチ（足回転数）・膝可動域・動作均等性の3項目を重み付き合算します。',
+    formula: 'ストライドスコア = ピッチ×40% + 膝スコア×30% + 動作均等性%×30%\n\nピッチ評価: 170〜190 spm → 95点\n160〜170 / 190〜200 → 80点\n150〜160 / 200〜210 → 65点\nそれ以外 → 45点',
+    ideal: 'ピッチ: 170〜190 spm（理想）',
+  },
+  arm: {
+    title: '腕振りスコア',
+    desc: '肘の屈曲角度（平均）と左右差（非対称ペナルティ）から算出します。',
+    formula: '肘角度 85〜95° → 90点ベース\n±10° → 75点ベース\n±20° → 55点ベース\n左右差 >15° → −10点（ペナルティ）',
+    ideal: '肘角度: 85〜95°（理想）、左右対称',
+  },
+  foot: {
+    title: '着地スコア',
+    desc: '踵(lm29/30)とつま先(lm31/32)のY座標差から着地パターンを分類しスコアを付与します。',
+    formula: 'フォアフット（つま先先行） → 90点\nミッドフット（ほぼ同時） → 82点\nヒールストライク（踵先行） → 62点',
+    ideal: 'フォアフット〜ミッドフットが理想',
+  },
+  pitch: {
+    title: 'ピッチ（歩数/分）',
+    desc: '足首(lm27/lm28)のY座標を5点移動平均後、極大点（接地タイミング）を検出し、ステップ間隔の中央値からピッチを算出します。',
+    formula: 'pitchPerMin = 60 / ステップ間隔中央値(秒)',
+    ideal: '170〜190 spm が理想範囲',
+  },
+  strideTime: {
+    title: 'ストライド周期',
+    desc: '一方の足が着地してから同じ足が次に着地するまでの時間（ステップ間隔×2）です。',
+    formula: 'strideTimeSec = ステップ間隔中央値 × 2',
+    ideal: '短い方が高ピッチで有利（ピッチ180spmなら約0.67秒）',
+  },
+  trunkLean: {
+    title: '体幹前傾角',
+    desc: '股関節中点→肩中点ベクトルと垂直軸(0,−1)のなす角。MediaPipeのY軸は下向きのため符号を補正しています。',
+    formula: 'hip_mid = (lm23 + lm24) / 2\nshoulder_mid = (lm11 + lm12) / 2\nvec = shoulder_mid − hip_mid\nangle = atan2(vec.x, −vec.y) × (180/π)',
+    ideal: '5〜10° の前傾が理想',
+  },
+  leftKnee: {
+    title: '左膝平均角',
+    desc: '左股関節(lm23)・左膝(lm25)・左足首(lm27)の3点から各フレームの膝屈曲角を求め平均します。',
+    formula: 'angle = arccos(dot(v1,v2) / (|v1|×|v2|))\nv1 = hip−knee, v2 = ankle−knee',
+    ideal: '走行中は概ね 130〜170°（ストライドにより変動）',
+  },
+  rightKnee: {
+    title: '右膝平均角',
+    desc: '右股関節(lm24)・右膝(lm26)・右足首(lm28)の3点から各フレームの膝屈曲角を求め平均します。',
+    formula: 'angle = arccos(dot(v1,v2) / (|v1|×|v2|))\nv1 = hip−knee, v2 = ankle−knee',
+    ideal: '左右差が小さいほど均等な走りを示す',
+  },
+  symmetry: {
+    title: '動作均等性',
+    desc: '左右の膝角・肘角の平均値差と標準偏差差を重み付き比較。左右が逆位相のため同フレーム比較ではなく統計量比較を採用しています。',
+    formula: 'score = 1 − (0.6×|avg_L−avg_R|/20° + 0.4×|std_L−std_R|/15°)\n100%が完全均等。値が高いほど左右バランスが良い。',
+    ideal: '90%以上が目標',
+  },
+  trunkStability: {
+    title: '体幹安定度',
+    desc: '体幹前傾角の時系列分散の逆数から求めます。分散が小さい（姿勢が安定）ほど高い値になります。',
+    formula: 'trunkStability = 1 / √variance（上限1.0）\nvariance < 1 の場合は 1.0（安定）とみなす',
+    ideal: '0.8以上が目安（1.0が最高）',
+  },
+  footPattern: {
+    title: '着地パターン',
+    desc: '各フレームで踵ランドマーク(lm29/30)とつま先ランドマーク(lm31/32)のY座標を比較し、最も多いパターンを判定します（Y軸は下向き）。',
+    formula: 'heel_y > toe_y + threshold → フォアフット\nabs(heel_y − toe_y) ≤ threshold → ミッドフット\ntoe_y > heel_y + threshold → ヒールストライク',
+    ideal: 'フォアフット〜ミッドフットが推奨',
+  },
+}
+
+function showHelp(key) {
+  const info = HELP_TEXTS[key]
+  if (!info) return
+  hideHelp()
+  const overlay = document.createElement('div')
+  overlay.className = 'help-overlay'
+  overlay.id = 'helpOverlay'
+  overlay.onclick = hideHelp
+  document.body.appendChild(overlay)
+
+  const popup = document.createElement('div')
+  popup.className = 'help-popup'
+  popup.id = 'helpPopup'
+  popup.innerHTML = \`
+    <button class="help-close" onclick="hideHelp()" title="閉じる">✕</button>
+    <h5><span style="color:#7dd3fc">?</span> \${info.title}</h5>
+    <p>\${info.desc}</p>
+    \${info.formula ? \`<div class="formula">\${info.formula.replace(/\\n/g,'<br>')}</div>\` : ''}
+    \${info.ideal ? \`<div class="ideal">✓ 理想値: \${info.ideal}</div>\` : ''}
+  \`
+  document.body.appendChild(popup)
+}
+
+function hideHelp() {
+  document.getElementById('helpOverlay')?.remove()
+  document.getElementById('helpPopup')?.remove()
+}
+
+// ==========================================
 // ストライド検出（足首Y座標の極小点から周期・ピッチを推定）
 // ==========================================
 function detectStride(frames) {
@@ -2371,21 +2545,25 @@ function showResult(data, summary) {
   const strideStr = summary.stride.strideTimeSec > 0
     ? summary.stride.strideTimeSec.toFixed(2) + ' 秒/stride'
     : '—'
+  // [ラベル, 値, helpKey(省略可)]
   const metrics = [
-    ['ピッチ',      pitchStr],
-    ['ストライド周期', strideStr],
-    ['体幹前傾角', summary.avgAngles.trunkLean.toFixed(1) + '°（理想: 5〜10°）'],
-    ['左膝平均角', summary.avgAngles.leftKnee.toFixed(1) + '°'],
-    ['右膝平均角', summary.avgAngles.rightKnee.toFixed(1) + '°'],
-    ['動作均等性', (summary.symmetryScore * 100).toFixed(1) + '%'],
-    ['体幹安定度', summary.trunkStability.toFixed(2)],
-    ['着地パターン', summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット'],
+    ['ピッチ',        pitchStr,                                                                                          'pitch'],
+    ['ストライド周期', strideStr,                                                                                         'strideTime'],
+    ['体幹前傾角',    summary.avgAngles.trunkLean.toFixed(1) + '°（理想: 5〜10°）',                                       'trunkLean'],
+    ['左膝平均角',    summary.avgAngles.leftKnee.toFixed(1) + '°',                                                       'leftKnee'],
+    ['右膝平均角',    summary.avgAngles.rightKnee.toFixed(1) + '°',                                                      'rightKnee'],
+    ['動作均等性',    (summary.symmetryScore * 100).toFixed(1) + '%',                                                    'symmetry'],
+    ['体幹安定度',    summary.trunkStability.toFixed(2),                                                                 'trunkStability'],
+    ['着地パターン',  summary.footStrikePattern === 'heel' ? 'ヒールストライク' : summary.footStrikePattern === 'midfoot' ? 'ミッドフット' : 'フォアフット', 'footPattern'],
     ['解析フレーム数', summary.frameCount + ' フレーム'],
-    ['動画時間', summary.duration.toFixed(1) + ' 秒'],
+    ['動画時間',      summary.duration.toFixed(1) + ' 秒'],
   ]
-  document.getElementById('metricsGrid').innerHTML = metrics.map(([k, v]) => \`
+  document.getElementById('metricsGrid').innerHTML = metrics.map(([k, v, hKey]) => \`
     <div class="bg-slate-700/50 rounded-lg p-3">
-      <p class="text-slate-400 text-xs mb-1">\${k}</p>
+      <p class="text-slate-400 text-xs mb-1 flex items-center gap-1">
+        \${k}
+        \${hKey ? \`<button class="help-btn" onclick="showHelp('\${hKey}')" title="説明">?</button>\` : ''}
+      </p>
       <p class="font-semibold text-white text-sm">\${v}</p>
     </div>
   \`).join('')
