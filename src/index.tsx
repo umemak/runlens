@@ -1478,16 +1478,14 @@ window.playSessionResult = function(id) {
   document.getElementById('sessionNameInput').value    = s.name
   document.getElementById('sessionNameInput').disabled = true
 
-  // 動画があれば reviewVideo にセット
-  const rv = document.getElementById('reviewVideo')
-  if (rv) {
-    if (s.video_key && s.video_key.startsWith('users/')) {
-      rv.src = \`/api/sessions/\${id}/video\`
-      rv.load()
-      rv.play().catch(() => {})
-    } else {
-      rv.src = ''
-    }
+  // 動画があれば reviewVideo にセット（canvas/ctx も初期化）
+  if (s.video_key && s.video_key.startsWith('users/')) {
+    setupReviewFromUrl(\`/api/sessions/\${id}/video\`)
+  } else {
+    // 動画なし：canvas だけ初期化しておく
+    const rv = document.getElementById('reviewVideo')
+    initReviewCanvas(rv)
+    rv.src = ''
   }
 
   // 画面遷移
@@ -2703,34 +2701,23 @@ async function fetchAIFeedback(summary) {
 // ==========================================
 // ワイヤーフレームレビュー
 // ==========================================
-function setupReview() {
-  const rv  = document.getElementById('reviewVideo')
+// canvas/ctx の初期化とイベント登録（動画ソースは設定しない）
+function initReviewCanvas(rv) {
   const rc  = document.getElementById('reviewCanvas')
   reviewCtx = rc.getContext('2d')
   reviewDrawUtils = new DrawingUtils(reviewCtx)
 
-  // 動画ソースをセット（解析時と同じファイル）
-  if (reviewVideoUrl) URL.revokeObjectURL(reviewVideoUrl)
-  reviewVideoUrl = URL.createObjectURL(selectedFile)
-  rv.src = reviewVideoUrl
-
   rv.addEventListener('loadedmetadata', () => {
-    // canvas サイズを動画に合わせる
     rc.width  = rv.videoWidth
     rc.height = rv.videoHeight
-
-    // シークバー最大値を動画時間に設定
     const seekEl = document.getElementById('reviewSeek')
     seekEl.max   = rv.duration
     document.getElementById('reviewDuration').textContent = rv.duration.toFixed(1) + 's'
-
-    // 最初のフレームを描画
     renderReviewFrame()
   }, { once: true })
 
-  // 再生中のループ描画
   rv.addEventListener('timeupdate', () => {
-    document.getElementById('reviewSeek').value        = rv.currentTime
+    document.getElementById('reviewSeek').value             = rv.currentTime
     document.getElementById('reviewCurrentTime').textContent = rv.currentTime.toFixed(1) + 's'
     renderReviewFrame()
   })
@@ -2739,6 +2726,24 @@ function setupReview() {
     document.getElementById('playPauseBtn').innerHTML =
       '<i class="fas fa-play mr-1"></i>再生'
   })
+}
+
+// 通常解析後の reviewVideo セットアップ（selectedFile から objectURL を作成）
+function setupReview() {
+  const rv = document.getElementById('reviewVideo')
+  initReviewCanvas(rv)
+  if (reviewVideoUrl) URL.revokeObjectURL(reviewVideoUrl)
+  reviewVideoUrl = URL.createObjectURL(selectedFile)
+  rv.src = reviewVideoUrl
+}
+
+// 履歴再生用セットアップ（URLを直接セット）
+function setupReviewFromUrl(url) {
+  const rv = document.getElementById('reviewVideo')
+  initReviewCanvas(rv)
+  if (reviewVideoUrl) { URL.revokeObjectURL(reviewVideoUrl); reviewVideoUrl = null }
+  rv.src = url
+  rv.load()
 }
 
 // 現在フレームの骨格を描画し角度パネルを更新
