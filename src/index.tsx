@@ -212,6 +212,7 @@ app.post('/api/sessions', requireAuth, async (c) => {
       result: any
       summary: any
       vector: number[]
+      poseFrames: any[]
     }
     if (!body.result || !body.summary) return c.json({ error: 'Invalid data' }, 400)
 
@@ -222,8 +223,8 @@ app.post('/api/sessions', requireAuth, async (c) => {
       INSERT INTO analyses
         (user_id, name, video_key, status,
          overall_score, posture_score, stride_score, arm_swing_score, foot_strike_score,
-         strengths, improvements, detailed_feedback, summary, vector, updated_at)
-      VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         strengths, improvements, detailed_feedback, summary, vector, pose_frames, updated_at)
+      VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `).bind(
       userId, name, videoKey,
       body.result.overall_score,
@@ -236,6 +237,7 @@ app.post('/api/sessions', requireAuth, async (c) => {
       body.result.detailed_feedback,
       JSON.stringify(body.summary),
       JSON.stringify(body.vector || []),
+      JSON.stringify(body.poseFrames || []),
     ).run()
 
     return c.json({ success: true, id: res.meta.last_row_id })
@@ -253,7 +255,7 @@ app.get('/api/sessions', requireAuth, async (c) => {
       SELECT id, name, video_key, overall_score, posture_score, stride_score,
              arm_swing_score, foot_strike_score,
              strengths, improvements, detailed_feedback,
-             summary, vector, created_at
+             summary, vector, pose_frames, created_at
       FROM analyses
       WHERE user_id = ? AND status = 'completed'
       ORDER BY created_at DESC
@@ -261,10 +263,11 @@ app.get('/api/sessions', requireAuth, async (c) => {
 
     const sessions = rows.results.map((r: any) => ({
       ...r,
-      strengths:   r.strengths   ? JSON.parse(r.strengths)   : [],
+      strengths:    r.strengths    ? JSON.parse(r.strengths)    : [],
       improvements: r.improvements ? JSON.parse(r.improvements) : [],
-      summary: r.summary ? JSON.parse(r.summary) : null,
-      vector:  r.vector  ? JSON.parse(r.vector)  : [],
+      summary:      r.summary      ? JSON.parse(r.summary)      : null,
+      vector:       r.vector       ? JSON.parse(r.vector)       : [],
+      pose_frames:  r.pose_frames  ? JSON.parse(r.pose_frames)  : [],
     }))
     return c.json({ sessions })
   } catch (e) {
@@ -1294,6 +1297,41 @@ function makeVector(result, summary) {
   ]
 }
 
+// poseFrames を圧縮（座標を小数3桁に丸めてサイズ削減）
+function compressPoseFrames(frames) {
+  return frames.map(f => ({
+    t: Math.round(f.timestamp * 1000) / 1000,  // 3桁
+    lm: f.landmarks.map(p => [
+      Math.round(p.x * 1000) / 1000,
+      Math.round(p.y * 1000) / 1000,
+      Math.round(p.z * 1000) / 1000,
+      Math.round((p.visibility ?? 1) * 100) / 100,
+    ]),
+    a: {
+      lk: Math.round(f.angles.leftKnee   * 10) / 10,
+      rk: Math.round(f.angles.rightKnee  * 10) / 10,
+      le: Math.round(f.angles.leftElbow  * 10) / 10,
+      re: Math.round(f.angles.rightElbow * 10) / 10,
+      tr: Math.round(f.angles.trunkLean  * 10) / 10,
+    },
+  }))
+}
+
+// 圧縮済みposeFramesを元の形式に展開
+function decompressPoseFrames(compressed) {
+  return compressed.map(f => ({
+    timestamp: f.t,
+    landmarks: f.lm.map(p => ({ x: p[0], y: p[1], z: p[2], visibility: p[3] })),
+    angles: {
+      leftKnee:   f.a.lk,
+      rightKnee:  f.a.rk,
+      leftElbow:  f.a.le,
+      rightElbow: f.a.re,
+      trunkLean:  f.a.tr,
+    },
+  }))
+}
+
 // コサイン類似度
 function cosineSim(a, b) {
   const dot = a.reduce((s, v, i) => s + v * b[i], 0)
@@ -1339,11 +1377,18 @@ window.saveCurrentSession = async function() {
 
     // 2. 分析結果をD1に保存
     btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> 結果を保存中...'
-    const vector = makeVector(currentResult, currentSummary)
+    const vector     = makeVector(currentResult, currentSummary)
+    const poseFramesCompressed = compressPoseFrames(poseFrames)
     const res = await fetch('/api/sessions', {
       method: 'POST', credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, videoKey, result: currentResult, summary: currentSummary, vector })
+      body: JSON.stringify({
+        name, videoKey,
+        result: currentResult,
+        summary: currentSummary,
+        vector,
+        poseFrames: poseFramesCompressed,
+      })
     })
     if (!res.ok) {
       const err = await res.json()
@@ -1463,6 +1508,11 @@ window.playSessionResult = function(id) {
     improvements:      s.improvements || [],
     detailed_feedback: s.detailed_feedback || '',
   }
+
+  // poseFrames をグローバルに復元（骨格オーバーレイ用）
+  poseFrames = (s.pose_frames && s.pose_frames.length > 0)
+    ? decompressPoseFrames(s.pose_frames)
+    : []
 
   // showResult で全UI復元（selectedFile が null のため setupReview はスキップ）
   showResult(result, s.summary, true)
